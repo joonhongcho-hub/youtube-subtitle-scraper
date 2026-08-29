@@ -1,0 +1,15 @@
+# 가상환경
+venv/
+.venv/
+
+# 수집 결과 — 타인의 채널 콘텐츠이므로 저장소에 포함하지 않는다
+output/
+output-*/
+
+# 파이썬
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# OS
+.DS_Store

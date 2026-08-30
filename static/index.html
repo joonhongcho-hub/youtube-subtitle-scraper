@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>유튜브 자막 수집기</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif; }
+  #console::-webkit-scrollbar { width: 10px; }
+  #console::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 5px; }
+</style>
+</head>
+<body class="bg-slate-50 text-slate-800">
+
+<div class="max-w-5xl mx-auto px-6 py-10">
+
+  <header class="mb-8">
+    <h1 class="text-2xl font-bold tracking-tight">유튜브 자막 수집기</h1>
+    <p class="text-sm text-slate-500 mt-1">채널의 모든 영상 자막을 모아 텍스트와 엑셀로 내려받습니다.</p>
+  </header>
+
+  <!-- 이전 작업 복구 배너 -->
+  <div id="resumeBar" class="hidden mb-6 px-4 py-3 rounded-lg border flex items-center gap-4 flex-wrap"></div>
+
+  <!-- 단계 표시 -->
+  <ol id="steps" class="flex items-center gap-2 text-xs mb-8 text-slate-400">
+    <li><button data-step="1" class="step px-3 py-1 rounded-full">1 채널 입력</button></li>
+    <li>→</li><li><button data-step="2" class="step px-3 py-1 rounded-full">2 수집 범위</button></li>
+    <li>→</li><li><button data-step="3" class="step px-3 py-1 rounded-full">3 실행</button></li>
+    <li>→</li><li><button data-step="4" class="step px-3 py-1 rounded-full">4 다운로드</button></li>
+  </ol>
+
+  <div id="error" class="hidden mb-6 px-4 py-3 rounded-lg bg-red-50 border border-red-200 text-red-700 text-sm"></div>
+
+  <!-- [1] 채널 입력 -->
+  <section id="screen1" class="bg-white rounded-xl border border-slate-200 p-8">
+    <label class="block text-sm font-medium mb-2">채널 URL 또는 채널명</label>
+    <div class="flex gap-3">
+      <div class="relative flex-1">
+        <input id="q" type="text" autocomplete="off"
+               placeholder="https://www.youtube.com/@jocoding  또는  조코딩"
+               class="w-full px-4 py-3 rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-slate-400">
+        <div id="suggest"
+             class="hidden absolute left-0 right-0 top-full mt-1 bg-white border border-slate-200 rounded-lg shadow-lg z-20 overflow-hidden"></div>
+      </div>
+      <button id="searchBtn" class="px-6 py-3 rounded-lg bg-slate-900 text-white font-medium hover:bg-slate-700 disabled:opacity-40">검색</button>
+    </div>
+    <p class="text-xs text-slate-500 mt-3">채널명을 입력하면 후보가 바로 아래에 뜹니다. URL을 붙여넣으면 곧장 확정됩니다.</p>
+  </section>
+
+  <!-- [2] 수집 범위 -->
+  <section id="screen2" class="hidden">
+    <div id="chanHead" class="mb-6"></div>
+
+    <div class="bg-white rounded-xl border border-slate-200 p-6 mb-5">
+      <div class="flex items-baseline justify-between mb-4">
+        <h3 class="font-semibold">영상 종류</h3>
+        <button id="refreshBtn" class="text-xs text-slate-500 hover:text-slate-800 underline">목록 새로고침</button>
+      </div>
+      <div id="sources" class="space-y-2"></div>
+      <div id="playlistBox" class="mt-4 border-t border-slate-100 pt-4"></div>
+      <div id="totalBox" class="mt-5 pt-4 border-t border-slate-200 text-sm font-medium"></div>
+    </div>
+
+    <div class="bg-white rounded-xl border border-slate-200 p-6 mb-5">
+      <h3 class="font-semibold mb-4">필터</h3>
+      <div id="filterWarn" class="hidden mb-4 px-3 py-2 rounded bg-amber-50 border border-amber-200 text-amber-800 text-xs"></div>
+      <div class="grid sm:grid-cols-2 gap-5">
+        <div>
+          <label class="block text-xs text-slate-500 mb-2">업로드 날짜</label>
+          <div class="flex items-center gap-2">
+            <div class="relative flex-1">
+              <input id="dateFrom" type="text" inputmode="numeric" placeholder="YYYY-MM-DD"
+                     class="filter datefield w-full pl-3 pr-9 py-2 rounded border border-slate-300 text-sm">
+              <button type="button" data-for="dateFrom"
+                      class="calbtn filter absolute right-1 top-1/2 -translate-y-1/2 px-1.5 py-1 text-slate-400 hover:text-slate-700"
+                      title="달력에서 고르기">📅</button>
+              <input type="date" data-picker="dateFrom" class="sr-only absolute right-2 bottom-0 w-0 h-0 opacity-0">
+            </div>
+            <span class="text-slate-400">~</span>
+            <div class="relative flex-1">
+              <input id="dateTo" type="text" inputmode="numeric" placeholder="YYYY-MM-DD"
+                     class="filter datefield w-full pl-3 pr-9 py-2 rounded border border-slate-300 text-sm">
+              <button type="button" data-for="dateTo"
+                      class="calbtn filter absolute right-1 top-1/2 -translate-y-1/2 px-1.5 py-1 text-slate-400 hover:text-slate-700"
+                      title="달력에서 고르기">📅</button>
+              <input type="date" data-picker="dateTo" class="sr-only absolute right-2 bottom-0 w-0 h-0 opacity-0">
+            </div>
+          </div>
+        </div>
+        <div>
+          <label class="block text-xs text-slate-500 mb-2">영상 길이 (분)</label>
+          <div class="flex items-center gap-2">
+            <input id="minMin" type="number" min="0" placeholder="최소" class="filter flex-1 px-3 py-2 rounded border border-slate-300 text-sm">
+            <span class="text-slate-400">~</span>
+            <input id="maxMin" type="number" min="0" placeholder="최대" class="filter flex-1 px-3 py-2 rounded border border-slate-300 text-sm">
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="bg-white rounded-xl border border-slate-200 p-6 mb-5">
+      <h3 class="font-semibold mb-4">정렬과 개수</h3>
+      <div class="grid sm:grid-cols-2 gap-5">
+        <div>
+          <label class="block text-xs text-slate-500 mb-2">정렬 기준</label>
+          <select id="sort" class="w-full px-3 py-2 rounded border border-slate-300 text-sm">
+            <option value="channel">채널 기본 순서 (최신순)</option>
+            <option value="views_desc">조회수 높은 순</option>
+            <option value="views_asc">조회수 낮은 순</option>
+            <option value="date_desc">업로드일 새로운 순</option>
+            <option value="date_asc">업로드일 오래된 순</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs text-slate-500 mb-2">개수 제한</label>
+          <div class="flex items-center gap-2">
+            <span class="text-sm text-slate-500">상위</span>
+            <input id="limit" type="number" min="0" placeholder="전체" class="flex-1 px-3 py-2 rounded border border-slate-300 text-sm">
+            <span class="text-sm text-slate-500">개만</span>
+          </div>
+        </div>
+      </div>
+      <div id="sortNote" class="text-xs text-slate-400 mt-3"></div>
+      <p class="text-xs text-slate-400 mt-1">
+        유튜브는 조회수를 반올림해 알려줍니다(32,000처럼). 영상별 구독자 증감은 채널 주인만 볼 수 있어 제공할 수 없습니다.
+      </p>
+    </div>
+
+    <div class="bg-white rounded-xl border border-slate-200 p-6 mb-6">
+      <h3 class="font-semibold mb-4">출력</h3>
+      <label class="flex items-center gap-3 text-sm mb-4">
+        <input id="ts" type="checkbox" class="w-4 h-4 rounded border-slate-300">
+        <span>타임스탬프 유지 <span class="text-slate-400">— 켜면 <code class="text-xs bg-slate-100 px-1 rounded">[00:12] 문장</code> 형태로 저장</span></span>
+      </label>
+      <label class="block text-xs text-slate-500 mb-2">자막 언어</label>
+      <select id="langs" class="px-3 py-2 rounded border border-slate-300 text-sm">
+        <option value="ko,en">한국어 자막, 없으면 영어</option>
+        <option value="en,ko">영어 자막, 없으면 한국어</option>
+        <option value="ko">한국어 자막만</option>
+        <option value="en">영어 자막만</option>
+      </select>
+      <p class="text-xs text-slate-400 mt-2">위 순서대로 자막을 찾습니다. 번역은 하지 않고, 영상에 이미 있는 자막만 가져옵니다.</p>
+    </div>
+
+    <div class="flex items-center gap-4">
+      <button id="startBtn" class="px-6 py-3 rounded-lg bg-slate-900 text-white font-medium hover:bg-slate-700 disabled:opacity-40">수집 시작</button>
+      <button class="back text-sm text-slate-500 hover:text-slate-800" data-to="1">← 다른 채널 고르기</button>
+    </div>
+  </section>
+
+  <!-- [3] 실행 중 -->
+  <section id="screen3" class="hidden">
+    <div class="bg-white rounded-xl border border-slate-200 p-6 mb-5">
+      <div class="flex items-baseline justify-between mb-3">
+        <div>
+          <span id="progNum" class="text-2xl font-bold tabular-nums">0 / 0</span>
+          <span id="progPct" class="text-slate-500 ml-2">(0%)</span>
+        </div>
+        <div class="text-right text-sm text-slate-500">
+          <div>경과 <span id="elapsed" class="tabular-nums">0:00</span></div>
+          <div>남은 시간 <span id="eta" class="tabular-nums">계산 중</span></div>
+        </div>
+      </div>
+      <div class="h-2 bg-slate-200 rounded-full overflow-hidden">
+        <div id="bar" class="h-full bg-slate-900 transition-all duration-300" style="width:0%"></div>
+      </div>
+      <div id="stallNote" class="hidden text-xs text-amber-600 mt-2"></div>
+    </div>
+
+    <div id="console" class="bg-zinc-900 text-zinc-300 rounded-xl p-4 h-96 overflow-y-auto font-mono text-xs leading-relaxed"></div>
+
+    <div class="mt-5">
+      <button id="stopBtn" class="px-5 py-2.5 rounded-lg border border-red-300 text-red-600 font-medium hover:bg-red-50">중지</button>
+      <span class="text-xs text-slate-500 ml-3">중지해도 지금까지 받은 자막은 그대로 보존됩니다.</span>
+    </div>
+  </section>
+
+  <!-- [4] 완료 -->
+  <section id="screen4" class="hidden">
+    <div class="bg-white rounded-xl border border-slate-200 p-6 mb-5">
+      <div class="flex items-start justify-between gap-4 mb-4">
+        <div id="summary" class="text-lg font-semibold"></div>
+        <label class="flex items-center gap-2 text-xs text-slate-600 shrink-0">
+          <input id="scopeAll" type="checkbox" class="w-4 h-4 rounded border-slate-300">
+          이 채널 전체 보기
+        </label>
+      </div>
+      <div id="reasons" class="space-y-2"></div>
+      <div id="retryBox" class="mt-4"></div>
+    </div>
+
+    <div class="bg-white rounded-xl border border-slate-200 p-6 mb-5">
+      <h3 class="font-semibold mb-4">다운로드</h3>
+      <div class="flex flex-wrap gap-3">
+        <button class="dl px-5 py-2.5 rounded-lg bg-slate-900 text-white text-sm font-medium hover:bg-slate-700" data-type="zip">전체 ZIP 다운로드</button>
+        <button class="dl px-5 py-2.5 rounded-lg border border-slate-300 text-sm font-medium hover:bg-slate-50" data-type="xlsx">index.xlsx만</button>
+        <button class="dl px-5 py-2.5 rounded-lg border border-slate-300 text-sm font-medium hover:bg-slate-50" data-type="merged">단일 텍스트로 병합</button>
+      </div>
+    </div>
+
+    <div class="bg-white rounded-xl border border-slate-200 overflow-hidden">
+      <h3 class="font-semibold px-6 pt-6 pb-3">영상 목록 <span class="text-xs font-normal text-slate-400">— 행을 클릭하면 자막을 미리 봅니다</span></h3>
+      <div class="max-h-96 overflow-y-auto">
+        <table class="w-full text-sm">
+          <thead class="bg-slate-50 sticky top-0">
+            <tr class="text-left text-xs text-slate-500">
+              <th class="px-6 py-2 font-medium">제목</th>
+              <th class="px-3 py-2 font-medium w-24">업로드일</th>
+              <th class="px-3 py-2 font-medium w-28">상태</th>
+              <th class="px-6 py-2 font-medium w-24 text-right">글자 수</th>
+            </tr>
+          </thead>
+          <tbody id="videoRows"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <button class="back mt-6 text-sm text-slate-500 hover:text-slate-800" data-to="1">← 새 채널 수집</button>
+  </section>
+</div>
+
+<!-- 미리보기 모달 -->
+<div id="modal" class="hidden fixed inset-0 bg-black/50 z-50 p-6 overflow-y-auto">
+  <div class="max-w-3xl mx-auto bg-white rounded-xl mt-10">
+    <div class="flex items-start justify-between gap-4 p-6 border-b border-slate-200">
+      <h3 id="modalTitle" class="font-semibold"></h3>
+      <div class="flex items-center gap-3 shrink-0">
+        <button id="modalDl" class="text-xs px-3 py-1.5 rounded border border-slate-300 hover:bg-slate-50">이 영상만 저장</button>
+        <button id="modalClose" class="text-slate-400 hover:text-slate-800 text-xl leading-none">&times;</button>
+      </div>
+    </div>
+    <pre id="modalText" class="p-6 whitespace-pre-wrap text-sm leading-relaxed max-h-[60vh] overflow-y-auto"></pre>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

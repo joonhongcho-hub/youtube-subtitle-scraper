@@ -13,7 +13,7 @@ MAX_FILENAME_LEN = 100
 # 이모지·기호·제어문자로 취급해 지우는 유니코드 카테고리
 DROP_CATEGORIES = {"Cc", "Cf", "Cs", "Co", "Cn", "So", "Sk"}
 
-INDEX_COLUMNS = ["영상 제목", "업로드일", "파일경로", "원본 URL", "상태"]
+INDEX_COLUMNS = ["영상 제목", "업로드일", "파일경로", "원본 URL", "상태", "글자 수"]
 
 
 def sanitize_filename(name, max_len=MAX_FILENAME_LEN):
@@ -52,12 +52,15 @@ def unique_path(dir_path, stem, ext=".txt"):
         i += 1
 
 
-def save_transcript(out_dir, channel_name, upload_date, title, text):
-    """자막 텍스트를 {출력폴더}/{채널명}/{업로드일}_{영상제목}.txt 로 저장한다."""
-    channel_dir = os.path.join(out_dir, sanitize_filename(channel_name))
-    os.makedirs(channel_dir, exist_ok=True)
+def save_transcript(out_dir, upload_date, title, text):
+    """자막 텍스트를 {채널폴더}/{업로드일}_{영상제목}.txt 로 저장한다.
+
+    out_dir이 곧 채널 폴더다 — 하위에 채널명 폴더를 또 만들지 않는다.
+    처리 기록·index.xlsx도 같은 폴더에 있어 채널 하나가 자기 완결적으로 담긴다.
+    """
+    os.makedirs(out_dir, exist_ok=True)
     stem = sanitize_filename("{}_{}".format(upload_date, title))
-    path = unique_path(channel_dir, stem)
+    path = unique_path(out_dir, stem)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
         if not text.endswith("\n"):
@@ -93,6 +96,7 @@ def write_index(records, path):
         "파일경로": r.get("path", ""),
         "원본 URL": r.get("url", ""),
         "상태": r.get("status", ""),
+        "글자 수": r.get("char_count", 0),
     } for r in records]
     df = pd.DataFrame(rows, columns=INDEX_COLUMNS)
     df.to_excel(path, index=False)

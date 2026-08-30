@@ -19,9 +19,23 @@ MODE_API = "transcript_api"
 MODE_YTDLP = "ytdlp_only"
 
 
+# 응답을 무한정 기다리지 않도록 (연결, 읽기) 초 단위 상한을 둔다.
+# 맥이 잠들어 소켓이 끊기면 requests는 기본적으로 영원히 기다린다 —
+# 진행률이 중간에서 멈춘 채 아무 일도 일어나지 않는 원인이 이것이다.
+DEFAULT_TIMEOUT = (10, 30)
+
+
+class TimeoutSession(requests.Session):
+    """timeout을 지정하지 않은 요청에 기본 상한을 채워주는 세션."""
+
+    def request(self, *args, **kwargs):
+        kwargs.setdefault("timeout", DEFAULT_TIMEOUT)
+        return super().request(*args, **kwargs)
+
+
 def make_session():
-    """브라우저 UA를 심은 requests 세션."""
-    session = requests.Session()
+    """브라우저 UA와 기본 타임아웃을 심은 requests 세션."""
+    session = TimeoutSession()
     session.headers.update({
         "User-Agent": BROWSER_UA,
         "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -34,7 +48,7 @@ def make_api():
     return YouTubeTranscriptApi(http_client=make_session())
 
 
-def verify_transcript_api(verbose=True):
+def verify_transcript_api(log=None):
     """[안전장치 B] 본 작업 전 youtube-transcript-api가 실제로 동작하는지 확인한다.
 
     프로브 영상으로 실제 요청을 보내 성공하면 MODE_API,
@@ -44,8 +58,8 @@ def verify_transcript_api(verbose=True):
         (mode, sample) — mode는 MODE_API 또는 MODE_YTDLP,
         sample은 성공 시 가져온 자막 앞부분 (실패 시 None)
     """
-    if verbose:
-        print("[사전 검증] youtube-transcript-api 동작 확인 중...")
+    log = log or (lambda level, message: None)
+    log("info", "[사전 검증] youtube-transcript-api 동작 확인 중...")
 
     api = make_api()
     errors = []
@@ -57,25 +71,25 @@ def verify_transcript_api(verbose=True):
             if not snippets:
                 raise RuntimeError("빈 자막 응답")
             sample = " ".join(s.text for s in snippets[:5])
-            if verbose:
-                print("  OK  {} ({})".format(video_id, label))
-                print("      언어: {} / 자동생성: {} / 조각 {}개".format(
-                    fetched.language_code, fetched.is_generated, len(snippets)))
-                print("      샘플: {}".format(sample[:120]))
-                print("[사전 검증] 통과 → transcript-api 기본 경로로 진행합니다.")
+            log("ok", "  OK  {} ({})".format(video_id, label))
+            log("info", "      언어: {} / 자동생성: {} / 조각 {}개".format(
+                fetched.language_code, fetched.is_generated, len(snippets)))
+            log("info", "      샘플: {}".format(sample[:120]))
+            log("ok", "[사전 검증] 통과 → transcript-api 기본 경로로 진행합니다.")
             return MODE_API, sample
         except Exception as exc:
             errors.append("  FAIL {} ({}): {}: {}".format(
                 video_id, label, type(exc).__name__, str(exc).strip().splitlines()[0][:160]))
 
-    if verbose:
-        print("\n".join(errors))
-        print("[사전 검증] 실패 → yt-dlp 단독 경로로 자동 전환합니다.")
+    for line in errors:
+        log("fail", line)
+    log("fail", "[사전 검증] 실패 → yt-dlp 단독 경로로 자동 전환합니다.")
     return MODE_YTDLP, None
 
 
 if __name__ == "__main__":
-    mode, _ = verify_transcript_api()
+    mode, _ = verify_transcript_api(
+        log=lambda level, message: print(message))
     print("\n판정된 모드: {}".format(mode))
 
 
@@ -146,7 +160,7 @@ def _classify_ytdlp_error(stderr):
     return FETCH_FAILED
 
 
-def fetch_via_api(video_id, langs, api=None):
+def fetch_via_api(video_id, langs, api=None, timestamps=False):
     """youtube-transcript-api 경로. 수동 자막 → 자동생성 자막 순으로 찾는다."""
     api = api or make_api()
     try:
@@ -164,12 +178,17 @@ def fetch_via_api(video_id, langs, api=None):
         return SubtitleResult(RATE_LIMITED, detail=type(exc).__name__)
     except (PoTokenRequired, YouTubeRequestFailed) as exc:
         return SubtitleResult(FETCH_FAILED, detail=type(exc).__name__)
+    except requests.exceptions.Timeout as exc:
+        return SubtitleResult(TIMEOUT, detail=type(exc).__name__)
+    except requests.exceptions.ConnectionError as exc:
+        return SubtitleResult(TIMEOUT, detail="연결 실패: {}".format(
+            str(exc)[:80]))
     except Exception as exc:
         return SubtitleResult(
             FETCH_FAILED,
             detail="{}: {}".format(type(exc).__name__, str(exc)[:120]))
 
-    text = cleaner.clean_snippets_text(list(fetched))
+    text = cleaner.clean_snippets_text(list(fetched), timestamps=timestamps)
     if not text.strip():
         return SubtitleResult(NO_SUBTITLES, detail="빈 자막")
     source = "auto" if transcript.is_generated else "manual"
@@ -227,7 +246,7 @@ def _pick_vtt(tmpdir, langs, manual_langs):
     return path, actual, kind_of(actual)
 
 
-def fetch_via_ytdlp(video_id, langs):
+def fetch_via_ytdlp(video_id, langs, timestamps=False):
     """yt-dlp 폴백 경로. 자막만 받고 영상은 받지 않는다.
 
     -J --no-simulate 로 자막 파일을 받으면서 메타데이터도 함께 얻는다.
@@ -277,7 +296,7 @@ def fetch_via_ytdlp(video_id, langs):
             return SubtitleResult(NO_SUBTITLES, detail="자막 파일 없음")
 
         with open(path, encoding="utf-8", errors="replace") as f:
-            text = cleaner.clean_vtt_text(f.read())
+            text = cleaner.clean_vtt_text(f.read(), timestamps=timestamps)
 
     if not text.strip():
         return SubtitleResult(NO_SUBTITLES, detail="정제 후 빈 텍스트")
@@ -285,33 +304,34 @@ def fetch_via_ytdlp(video_id, langs):
                           source="yt-dlp/" + kind)
 
 
-def _fetch_once(video_id, langs, mode, api):
+def _fetch_once(video_id, langs, mode, api, timestamps=False):
     """한 번의 수집 시도 — transcript-api 실패 시 yt-dlp로 폴백."""
     if mode != MODE_API:
-        return fetch_via_ytdlp(video_id, langs)
+        return fetch_via_ytdlp(video_id, langs, timestamps=timestamps)
 
-    result = fetch_via_api(video_id, langs, api=api)
+    result = fetch_via_api(video_id, langs, api=api, timestamps=timestamps)
     if result.ok or result.status == PRIVATE_VIDEO:
         return result
     # NO_SUBTITLES 포함 — transcript-api가 못 봐도 yt-dlp는 볼 수 있다
-    fallback = fetch_via_ytdlp(video_id, langs)
+    fallback = fetch_via_ytdlp(video_id, langs, timestamps=timestamps)
     if fallback.ok:
         return fallback
     # 두 경로 모두 실패하면 더 구체적인 사유를 남긴다
     return fallback if fallback.status != FETCH_FAILED else result
 
 
-def fetch_subtitle(video_id, langs, mode=MODE_API, api=None, verbose=True):
+def fetch_subtitle(video_id, langs, mode=MODE_API, api=None, log=None,
+                   timestamps=False):
     """자막 수집 진입점.
 
     429 등 차단 응답이면 exponential backoff(1초 → 2초 → 4초)로 재시도한다.
     """
-    result = _fetch_once(video_id, langs, mode, api)
+    log = log or (lambda level, message: None)
+    result = _fetch_once(video_id, langs, mode, api, timestamps=timestamps)
     for delay in BACKOFF_SECONDS:
         if result.status not in (RATE_LIMITED, TIMEOUT):
             break
-        if verbose:
-            print("      {} — {}초 후 재시도".format(result.status, delay))
+        log("fail", "      {} — {}초 후 재시도".format(result.status, delay))
         time.sleep(delay)
-        result = _fetch_once(video_id, langs, mode, api)
+        result = _fetch_once(video_id, langs, mode, api, timestamps=timestamps)
     return result

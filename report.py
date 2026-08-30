@@ -7,7 +7,17 @@ MAX_RETRY_ROUNDS = 3
 # 재시도 시 대기 시간 배수
 RETRY_SLEEP_MULTIPLIER = 2.5
 
+# 사용자에게 보여줄 실패 원인 설명
 REASON_LABELS = {
+    subtitle.NO_SUBTITLES: "이 영상에는 자막이 없습니다 (자동 생성 자막도 없음)",
+    subtitle.PRIVATE_VIDEO: "멤버십 전용·비공개·삭제된 영상이라 자막을 가져올 수 없습니다",
+    subtitle.FETCH_FAILED: "일시적인 요청 실패입니다",
+    subtitle.RATE_LIMITED: "일시적인 요청 실패입니다 (유튜브가 요청을 제한했습니다)",
+    subtitle.TIMEOUT: "일시적인 요청 실패입니다 (시간 초과)",
+}
+
+# 터미널 리포트용 짧은 표기
+SHORT_LABELS = {
     subtitle.NO_SUBTITLES: "자막이 아예 없음",
     subtitle.PRIVATE_VIDEO: "비공개/삭제/멤버십 전용",
     subtitle.FETCH_FAILED: "요청 실패",
@@ -32,33 +42,13 @@ def retryable_records(records):
             and r.get("attempts", 1) < MAX_RETRY_ROUNDS + 1]
 
 
-def print_report(records):
-    """실행 종료 후 리포트를 출력한다."""
+def counts_by_reason(records):
+    """실패 사유별 개수 — 성공은 제외한다."""
     counts = summarize(records)
-    success = counts.pop(subtitle.SUCCESS, 0)
-    failed = sum(counts.values())
-
-    print("\n" + "=" * 46)
-    print("성공: {}개".format(success))
-    print("실패: {}개".format(failed))
-    for reason in (subtitle.NO_SUBTITLES, subtitle.PRIVATE_VIDEO,
-                   subtitle.FETCH_FAILED, subtitle.RATE_LIMITED, subtitle.TIMEOUT):
-        n = counts.get(reason, 0)
-        if not n:
-            continue
-        suffix = " (재시도 불가)" if reason in subtitle.NON_RETRYABLE else ""
-        print("  - {}: {}개{}".format(reason, n, suffix))
-    print("=" * 46)
+    counts.pop(subtitle.SUCCESS, None)
+    return counts
 
 
-def ask_retry(pending, round_index):
-    """재시도 여부를 묻는다. 상한에 도달하면 묻지 않는다."""
-    if not pending:
-        return False
-    if round_index >= MAX_RETRY_ROUNDS:
-        print("\n재시도 가능한 {}개가 남았지만 재시도 상한({}회)에 도달했습니다."
-              .format(len(pending), MAX_RETRY_ROUNDS))
-        return False
-    answer = input("\n재시도 가능한 {}개가 있습니다. 다시 시도할까요? (y/n): "
-                   .format(len(pending))).strip().lower()
-    return answer in ("y", "yes")
+def describe(reason):
+    """실패 사유를 사용자가 이해할 수 있는 문구로 바꾼다."""
+    return REASON_LABELS.get(reason, reason)

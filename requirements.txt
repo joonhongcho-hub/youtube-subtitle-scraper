@@ -3,3 +3,5 @@ youtube-transcript-api
 pandas
 openpyxl
 curl-cffi
+fastapi
+uvicorn[standard]

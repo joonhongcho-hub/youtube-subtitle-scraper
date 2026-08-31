@@ -20,9 +20,16 @@
     <p class="text-sm text-slate-500 mt-1">채널의 모든 영상 자막을 모아 텍스트와 엑셀로 내려받습니다.</p>
   </header>
 
+  <!-- 수집 / 검색 -->
+  <div class="flex gap-1 mb-6 border-b border-slate-200">
+    <button data-mode="collect" class="mode px-4 py-2 text-sm font-medium border-b-2">자막 수집</button>
+    <button data-mode="find" class="mode px-4 py-2 text-sm font-medium border-b-2">자막 검색</button>
+  </div>
+
   <!-- 이전 작업 복구 배너 -->
   <div id="resumeBar" class="hidden mb-6 px-4 py-3 rounded-lg border flex items-center gap-4 flex-wrap"></div>
 
+  <div id="collectMode">
   <!-- 단계 표시 -->
   <ol id="steps" class="flex items-center gap-2 text-xs mb-8 text-slate-400">
     <li><button data-step="1" class="step px-3 py-1 rounded-full">1 채널 입력</button></li>
@@ -69,6 +76,14 @@
       <div class="grid sm:grid-cols-2 gap-5">
         <div>
           <label class="block text-xs text-slate-500 mb-2">업로드 날짜</label>
+          <div id="datePresets" class="flex flex-wrap gap-1 mb-2">
+            <button type="button" class="preset filter px-2 py-1 rounded border border-slate-300 text-xs hover:bg-slate-50" data-days="0">전체</button>
+            <button type="button" class="preset filter px-2 py-1 rounded border border-slate-300 text-xs hover:bg-slate-50" data-days="7">최근 7일</button>
+            <button type="button" class="preset filter px-2 py-1 rounded border border-slate-300 text-xs hover:bg-slate-50" data-days="30">30일</button>
+            <button type="button" class="preset filter px-2 py-1 rounded border border-slate-300 text-xs hover:bg-slate-50" data-days="90">90일</button>
+            <button type="button" class="preset filter px-2 py-1 rounded border border-slate-300 text-xs hover:bg-slate-50" data-days="365">1년</button>
+            <button type="button" class="preset filter px-2 py-1 rounded border border-slate-300 text-xs hover:bg-slate-50" data-days="1095">3년</button>
+          </div>
           <div class="flex items-center gap-2">
             <div class="relative flex-1">
               <input id="dateFrom" type="text" inputmode="numeric" placeholder="YYYY-MM-DD"
@@ -125,6 +140,18 @@
       <div id="sortNote" class="text-xs text-slate-400 mt-3"></div>
       <p class="text-xs text-slate-400 mt-1">
         유튜브는 조회수를 반올림해 알려줍니다(32,000처럼). 영상별 구독자 증감은 채널 주인만 볼 수 있어 제공할 수 없습니다.
+      </p>
+    </div>
+
+    <div class="bg-white rounded-xl border border-slate-200 p-6 mb-5">
+      <h3 class="font-semibold mb-3">저장 위치</h3>
+      <div class="flex items-center gap-3 flex-wrap">
+        <code id="rootPath" class="flex-1 min-w-0 truncate px-3 py-2 rounded bg-slate-50 border border-slate-200 text-xs">…</code>
+        <button id="pickFolderBtn" class="px-4 py-2 rounded-lg border border-slate-300 text-sm font-medium hover:bg-slate-50">폴더 선택</button>
+      </div>
+      <p class="text-xs text-slate-400 mt-2">
+        자막이 이 폴더 안에 채널별로 저장됩니다.
+        위치를 바꾸면 이전에 받은 자막이 그 폴더에 없어 <b>이어받기가 되지 않고 처음부터 다시 받습니다.</b>
       </p>
     </div>
 
@@ -218,6 +245,44 @@
     </div>
 
     <button class="back mt-6 text-sm text-slate-500 hover:text-slate-800" data-to="1">← 새 채널 수집</button>
+  </section>
+  </div>
+
+  <!-- 자막 검색 -->
+  <section id="findMode" class="hidden">
+    <div class="bg-white rounded-xl border border-slate-200 p-6 mb-5">
+      <div class="flex gap-3">
+        <input id="fq" type="text" autocomplete="off"
+               placeholder="찾을 단어를 띄어쓰기로 (예: 창업 수익화 자동매매)"
+               class="flex-1 px-4 py-3 rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-slate-400">
+        <select id="fchannel" class="px-3 py-3 rounded-lg border border-slate-300 text-sm">
+          <option value="">전체 채널</option>
+        </select>
+        <button id="fbtn" class="px-6 py-3 rounded-lg bg-slate-900 text-white font-medium hover:bg-slate-700">검색</button>
+      </div>
+      <div class="flex items-center justify-between mt-3 flex-wrap gap-2">
+        <p class="text-xs text-slate-500">
+          키워드 검색입니다. 문장보다 <b>핵심 단어</b>를 넣을 때 정확합니다.
+        </p>
+        <div class="text-xs text-slate-400">
+          <span id="findStatus">색인 확인 중…</span>
+          <button id="reindexBtn" class="underline hover:text-slate-700 ml-2">색인 갱신</button>
+        </div>
+      </div>
+      <div id="findNote" class="hidden mt-3 px-3 py-2 rounded bg-amber-50 border border-amber-200 text-amber-800 text-xs"></div>
+    </div>
+
+    <div id="findActions" class="hidden bg-white rounded-xl border border-slate-200 p-4 mb-5 flex items-center gap-3 flex-wrap">
+      <label class="flex items-center gap-2 text-sm">
+        <input id="fcheckAll" type="checkbox" class="w-4 h-4 rounded border-slate-300"> 전체 선택
+      </label>
+      <span id="fcount" class="text-sm text-slate-500"></span>
+      <span class="flex-1"></span>
+      <button class="fexp px-4 py-2 rounded-lg bg-slate-900 text-white text-sm font-medium hover:bg-slate-700" data-type="merged">하나로 합쳐 내보내기</button>
+      <button class="fexp px-4 py-2 rounded-lg border border-slate-300 text-sm font-medium hover:bg-slate-50" data-type="zip">ZIP으로 내보내기</button>
+    </div>
+
+    <div id="findResults" class="space-y-2"></div>
   </section>
 </div>
 

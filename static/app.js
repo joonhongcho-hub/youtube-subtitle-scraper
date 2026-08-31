@@ -825,3 +825,242 @@ function resetForNewChannel() {
 
 renderSteps(1);
 checkPreviousJob();
+
+// --- 수집 / 검색 모드 전환 ---
+
+function setMode(mode) {
+  clearError();
+  $('collectMode').classList.toggle('hidden', mode !== 'collect');
+  $('findMode').classList.toggle('hidden', mode !== 'find');
+  document.querySelectorAll('.mode').forEach((btn) => {
+    const on = btn.dataset.mode === mode;
+    btn.className = 'mode px-4 py-2 text-sm font-medium border-b-2 ' + (on
+      ? 'border-slate-900 text-slate-900'
+      : 'border-transparent text-slate-400 hover:text-slate-700');
+  });
+  if (mode === 'find') loadFindStatus();
+}
+
+document.querySelectorAll('.mode').forEach((btn) => {
+  btn.addEventListener('click', () => setMode(btn.dataset.mode));
+});
+
+// --- 업로드 날짜 프리셋 ---
+
+// 오늘로부터 N일 전을 시작일로 채운다. 직접 입력·달력은 그대로 살아 있고,
+// 값을 고치면 아래 하이라이트가 풀린다.
+document.querySelectorAll('.preset').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const days = Number(btn.dataset.days);
+    if (days > 0) {
+      const from = new Date();
+      from.setDate(from.getDate() - days);
+      $('dateFrom').value = from.toISOString().slice(0, 10);
+    } else {
+      $('dateFrom').value = '';
+    }
+    $('dateTo').value = '';
+    document.querySelectorAll('.datefield').forEach(markDateValidity);
+    highlightPreset(btn.dataset.days);
+    updateSelection();
+  });
+});
+
+function highlightPreset(days) {
+  document.querySelectorAll('.preset').forEach((b) => {
+    const on = days != null && b.dataset.days === String(days);
+    b.classList.toggle('bg-slate-900', on);
+    b.classList.toggle('text-white', on);
+    b.classList.toggle('border-slate-900', on);
+  });
+}
+
+document.querySelectorAll('.datefield').forEach((el) => {
+  el.addEventListener('input', () => highlightPreset(null));
+});
+
+// --- 저장 위치 ---
+
+async function loadRoot() {
+  try {
+    const data = await api('/api/settings');
+    $('rootPath').textContent = data.output_root;
+  } catch (e) { /* 기본값 유지 */ }
+}
+
+$('pickFolderBtn').addEventListener('click', async () => {
+  const btn = $('pickFolderBtn');
+  btn.disabled = true; btn.textContent = '창에서 고르는 중…';
+  try {
+    const picked = await api('/api/pick-folder', { method: 'POST' });
+    if (!picked.cancelled) {
+      const saved = await api('/api/settings/root', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: picked.path }),
+      });
+      $('rootPath').textContent = saved.output_root;
+    }
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    btn.disabled = false; btn.textContent = '폴더 선택';
+  }
+});
+
+// --- 자막 검색 ---
+
+let findRows = [];
+
+async function loadFindStatus() {
+  try {
+    const s = await api('/api/search/status');
+    $('findStatus').textContent = `색인 ${formatCount(s.total)}개`;
+    const select = $('fchannel');
+    const current = select.value;
+    select.innerHTML = '<option value="">전체 채널</option>' +
+      s.channels.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+    select.value = current;
+  } catch (e) {
+    $('findStatus').textContent = '색인 없음';
+  }
+}
+
+$('reindexBtn').addEventListener('click', async () => {
+  const el = $('findStatus');
+  el.textContent = '색인 갱신 중…';
+  try {
+    const r = await api('/api/search/index', { method: 'POST' });
+    el.textContent = `색인 ${formatCount(r.total)}개 (추가 ${r.added} · 변경 ${r.updated})`;
+    loadFindStatus();
+  } catch (err) { showError(err.message); }
+});
+
+$('fbtn').addEventListener('click', runFind);
+$('fq').addEventListener('keydown', (e) => { if (e.key === 'Enter') runFind(); });
+$('fchannel').addEventListener('change', () => { if ($('fq').value.trim()) runFind(); });
+
+async function runFind() {
+  const q = $('fq').value.trim();
+  if (!q) return;
+  const btn = $('fbtn');
+  btn.disabled = true; btn.textContent = '검색 중…';
+  try {
+    const url = `/api/search?q=${encodeURIComponent(q)}`
+      + `&channel=${encodeURIComponent($('fchannel').value)}&limit=50`;
+    const data = await api(url);
+    findRows = data.results;
+    renderFind(data);
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    btn.disabled = false; btn.textContent = '검색';
+  }
+}
+
+function renderFind(data) {
+  const note = $('findNote');
+  if (data.note) { note.textContent = data.note; note.classList.remove('hidden'); }
+  else note.classList.add('hidden');
+
+  const box = $('findResults');
+  if (!data.results.length) {
+    box.innerHTML = '<div class="text-sm text-slate-400 py-8 text-center">결과가 없습니다.</div>';
+    $('findActions').classList.add('hidden');
+    return;
+  }
+  $('findActions').classList.remove('hidden');
+  $('fcheckAll').checked = false;
+
+  box.innerHTML = data.results.map((r, i) => `
+    <div class="bg-white rounded-lg border border-slate-200 p-4 flex gap-3">
+      <input type="checkbox" class="fpick mt-1 w-4 h-4 rounded border-slate-300 shrink-0" data-i="${i}">
+      <div class="min-w-0 flex-1">
+        <div class="flex items-baseline gap-2 flex-wrap">
+          <button class="fopen font-medium text-sm text-left hover:underline" data-i="${i}">${escapeHtml(r.title)}</button>
+          <span class="text-xs text-slate-400">${escapeHtml(r.channel)} · ${r.upload_date || '—'} · ${formatCount(r.char_count)}자</span>
+        </div>
+        <div class="text-xs text-slate-600 mt-1 leading-relaxed">${highlightSnippet(r.snippet)}</div>
+      </div>
+    </div>`).join('');
+
+  box.querySelectorAll('.fpick').forEach((cb) => cb.addEventListener('change', updateFindCount));
+  box.querySelectorAll('.fopen').forEach((btn) => {
+    btn.addEventListener('click', () => openFindPreview(findRows[Number(btn.dataset.i)]));
+  });
+  updateFindCount();
+}
+
+// 서버가 «»로 감싼 일치 부분을 강조로 바꾼다 (HTML은 먼저 이스케이프)
+function highlightSnippet(text) {
+  return escapeHtml(text || '')
+    .replace(/«/g, '<mark class="bg-amber-200 rounded px-0.5">')
+    .replace(/»/g, '</mark>');
+}
+
+$('fcheckAll').addEventListener('change', () => {
+  const on = $('fcheckAll').checked;
+  document.querySelectorAll('.fpick').forEach((cb) => { cb.checked = on; });
+  updateFindCount();
+});
+
+function selectedPaths() {
+  return [...document.querySelectorAll('.fpick:checked')]
+    .map((cb) => findRows[Number(cb.dataset.i)].path);
+}
+
+function updateFindCount() {
+  const n = selectedPaths().length;
+  $('fcount').textContent = n ? `${formatCount(n)}개 선택됨` : '내보낼 자막을 선택하세요';
+  document.querySelectorAll('.fexp').forEach((b) => { b.disabled = !n; b.classList.toggle('opacity-40', !n); });
+}
+
+document.querySelectorAll('.fexp').forEach((btn) => {
+  btn.addEventListener('click', async () => {
+    const paths = selectedPaths();
+    if (!paths.length) return;
+    const original = btn.textContent;
+    btn.disabled = true; btn.textContent = '준비 중…';
+    try {
+      const res = await fetch('/api/search/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paths, type: btn.dataset.type }),
+      });
+      if (!res.ok) {
+        let message = '내보내기에 실패했습니다.';
+        try { message = (await res.json()).detail || message; } catch (e) { /* 무시 */ }
+        throw new Error(typeof message === 'string' ? message : '내보내기에 실패했습니다.');
+      }
+      saveBlob(await res.blob(), filenameFrom(res, btn.dataset.type === 'zip' ? 'zip' : 'merged'));
+    } catch (err) {
+      showError(err.message);
+    } finally {
+      btn.disabled = false; btn.textContent = original;
+    }
+  });
+});
+
+async function openFindPreview(row) {
+  try {
+    const res = await fetch('/api/search/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths: [row.path], type: 'merged' }),
+    });
+    if (!res.ok) throw new Error('자막을 불러오지 못했습니다.');
+    const text = await res.text();
+    $('modalTitle').textContent = row.title;
+    $('modalText').textContent = text;
+    $('modal').classList.remove('hidden');
+    $('modalDl').onclick = () => {
+      const name = row.title.replace(/[\\/:*?"<>|]/g, '_').slice(0, 100) + '.txt';
+      saveBlob(new Blob([text], { type: 'text/plain;charset=utf-8' }), name);
+    };
+  } catch (err) {
+    showError(err.message);
+  }
+}
+
+setMode('collect');
+loadRoot();

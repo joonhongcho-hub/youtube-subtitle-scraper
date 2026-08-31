@@ -4,6 +4,8 @@ import asyncio
 import concurrent.futures
 import io
 import os
+import shlex
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -18,6 +20,7 @@ import channel
 import engine
 import jobs
 import report
+import search
 import storage
 import subtitle
 
@@ -87,9 +90,36 @@ def attachment_headers(filename):
                 ascii_name, quoted)}
 
 
+SETTINGS_PATH = os.path.join(BASE_DIR, "output", "_settings.json")
+
+
+def load_settings():
+    """저장 위치 설정. 써 본 폴더를 모두 기억해 검색이 전부를 훑게 한다."""
+    data = storage.load_json(SETTINGS_PATH, {})
+    root = data.get("output_root") or OUTPUT_ROOT
+    roots = data.get("known_roots") or []
+    if root not in roots:
+        roots = [root] + roots
+    return {"output_root": root, "known_roots": roots}
+
+
+def save_settings(root):
+    current = load_settings()
+    roots = [r for r in current["known_roots"] if r != root]
+    storage.save_json(SETTINGS_PATH, {
+        "output_root": root,
+        "known_roots": [root] + roots,
+    })
+    return load_settings()
+
+
+def output_root():
+    return load_settings()["output_root"]
+
+
 def channel_dir(channel_name):
     """채널별 결과 폴더. 재실행하면 이미 받은 자막을 건너뛰어 이어받는다."""
-    return os.path.join(OUTPUT_ROOT, storage.sanitize_filename(channel_name))
+    return os.path.join(output_root(), storage.sanitize_filename(channel_name))
 
 
 def apply_filters(videos, filters, source):
@@ -332,6 +362,11 @@ def run_collection(job, videos, sleep_multiplier=1.0, skip_done=True):
             timestamps=options.get("timestamps", False))
 
         job.finish(jobs.STATUS_STOPPED if job.cancel.is_set() else jobs.STATUS_DONE)
+        try:      # 검색이 방금 받은 자막을 바로 찾을 수 있게
+            search.build_index(load_settings()["known_roots"],
+                               log=lambda m: job.log("info", m))
+        except Exception as exc:
+            job.log("fail", "색인 갱신 실패: {}".format(exc))
     except Exception as exc:  # 스레드에서 죽으면 흔적이 남지 않으므로 붙잡는다
         message = "{}: {}".format(type(exc).__name__, exc)
         job.log("fail", "작업 실패: {}".format(message))
@@ -564,22 +599,65 @@ def api_job_video_text(job_id: str, video_id: str):
     return {"video_id": video_id, "title": record["title"], "text": text}
 
 
-def merged_text(job, records):
-    """전체를 한 파일로 이어붙인다. 영상 사이에 제목·URL·업로드일을 넣는다."""
+def merge_documents(items):
+    """자막 여러 개를 한 파일로 이어붙인다.
+
+    items는 {path, title, upload_date, url} 목록이다. 작업이 아니라 경로를 받으므로
+    수집 결과와 검색 결과 양쪽에서 쓸 수 있다 — 검색 결과는 여러 채널·여러
+    저장 폴더에 흩어져 있어 작업 폴더 하나를 전제할 수 없다.
+    """
     parts = []
-    for record in records:
-        if record["status"] != subtitle.SUCCESS or not record.get("path"):
+    for item in items:
+        path = item.get("path")
+        if not path or not os.path.exists(path):
             continue
-        path = os.path.join(job.out_dir, record["path"])
-        if not os.path.exists(path):
-            continue
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             body = f.read().strip()
         parts.append(
             "{sep}\n제목: {title}\n업로드일: {date}\nURL: {url}\n{sep}\n\n{body}\n".format(
-                sep="=" * 70, title=record["title"],
-                date=record["upload_date"], url=record["url"], body=body))
+                sep="=" * 70, title=item.get("title", ""),
+                date=item.get("upload_date", ""), url=item.get("url", ""), body=body))
     return "\n\n".join(parts)
+
+
+def zip_documents(items, extra=None):
+    """자막 여러 개를 ZIP으로 묶는다. 채널명을 폴더로 둔다.
+
+    extra는 (실제경로, ZIP안의이름) 목록 — 인덱스 파일을 함께 넣을 때 쓴다.
+    """
+    buffer = io.BytesIO()
+    used = set()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for item in items:
+            path = item.get("path")
+            if not path or not os.path.exists(path):
+                continue
+            name = os.path.join(item.get("channel") or "", os.path.basename(path))
+            if name in used:      # 다른 폴더에 같은 이름이 있을 수 있다
+                stem, ext = os.path.splitext(name)
+                name = "{}_{}{}".format(stem, len(used), ext)
+            used.add(name)
+            zf.write(path, name)
+        for src, arcname in (extra or []):
+            if os.path.exists(src):
+                zf.write(src, arcname)
+    return buffer.getvalue()
+
+
+def job_items(job, records):
+    """작업 기록을 merge_documents가 받는 형태로 바꾼다."""
+    items = []
+    for record in records:
+        if record["status"] != subtitle.SUCCESS or not record.get("path"):
+            continue
+        items.append({
+            "path": os.path.join(job.out_dir, record["path"]),
+            "channel": job.channel_name,
+            "title": record.get("title", ""),
+            "upload_date": record.get("upload_date", ""),
+            "url": record.get("url", ""),
+        })
+    return items
 
 
 @app.get("/api/jobs/{job_id}/download")
@@ -601,28 +679,131 @@ def api_job_download(job_id: str,
                                        "officedocument.spreadsheetml.sheet")
 
     if type == "merged":
-        text = merged_text(job, records)
+        text = merge_documents(job_items(job, records))
         return Response(
             content=text.encode("utf-8"),
             media_type="text/plain; charset=utf-8",
             headers=attachment_headers("{}_merged.txt".format(stem)))
 
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for record in records:
-            if record["status"] != subtitle.SUCCESS or not record.get("path"):
-                continue
-            path = os.path.join(job.out_dir, record["path"])
-            if os.path.exists(path):
-                zf.write(path, record["path"])
-        os.makedirs(jobs.JOBS_DIR, exist_ok=True)
-        index_tmp = os.path.join(jobs.JOBS_DIR, "{}_index_{}.xlsx".format(job.id, scope))
-        storage.write_index(records, index_tmp)
-        zf.write(index_tmp, "index.xlsx")
+    os.makedirs(jobs.JOBS_DIR, exist_ok=True)
+    index_tmp = os.path.join(jobs.JOBS_DIR, "{}_index_{}.xlsx".format(job.id, scope))
+    storage.write_index(records, index_tmp)
+    payload = zip_documents(job_items(job, records),
+                            extra=[(index_tmp, "index.xlsx")])
+    return Response(content=payload, media_type="application/zip",
+                    headers=attachment_headers("{}.zip".format(stem)))
 
-    return Response(
-        content=buffer.getvalue(), media_type="application/zip",
-        headers=attachment_headers("{}.zip".format(stem)))
+
+# --- 저장 위치 ---
+
+class RootRequest(BaseModel):
+    path: str
+
+
+@app.get("/api/settings")
+def api_settings():
+    settings = load_settings()
+    settings["default_root"] = OUTPUT_ROOT
+    return settings
+
+
+@app.post("/api/settings/root")
+def api_set_root(req: RootRequest):
+    path = os.path.abspath(os.path.expanduser(req.path.strip()))
+    if not os.path.isdir(path):
+        raise HTTPException(400, "폴더를 찾을 수 없습니다: {}".format(path))
+    if not os.access(path, os.W_OK):
+        raise HTTPException(400, "이 폴더에 쓸 권한이 없습니다: {}".format(path))
+    return save_settings(path)
+
+
+# 폴더 선택 창은 사용자가 닫을 때까지 돌아오지 않는다. 서버가 멈추지 않도록
+# 별도 스레드에서 돌리고 상한을 둔다.
+FOLDER_PICK_TIMEOUT = 180
+
+
+def _choose_folder():
+    """맥 기본 폴더 선택 창을 띄운다.
+
+    activate를 넣지 않으면 창이 브라우저 뒤에 떠서 아무 일도 없는 것처럼 보인다.
+    """
+    script = (
+        'tell application "System Events" to activate\n'
+        'set f to choose folder with prompt "자막을 저장할 폴더를 고르세요"\n'
+        'return POSIX path of f'
+    )
+    proc = subprocess.run(["osascript", "-e", script],
+                          capture_output=True, text=True,
+                          timeout=FOLDER_PICK_TIMEOUT)
+    if proc.returncode != 0:
+        return None            # 사용자가 취소한 경우도 여기로 온다
+    return proc.stdout.strip() or None
+
+
+@app.post("/api/pick-folder")
+def api_pick_folder():
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            path = pool.submit(_choose_folder).result(
+                timeout=FOLDER_PICK_TIMEOUT + 5)
+    except (subprocess.TimeoutExpired, concurrent.futures.TimeoutError):
+        raise HTTPException(408, "폴더 선택 창이 응답하지 않았습니다.")
+    except FileNotFoundError:
+        raise HTTPException(400, "이 시스템에서는 폴더 선택 창을 열 수 없습니다. 경로를 직접 입력해 주세요.")
+    if not path:
+        return {"cancelled": True}
+    return {"cancelled": False, "path": os.path.normpath(path)}
+
+
+# --- 자막 검색 ---
+
+class ExportRequest(BaseModel):
+    paths: list = []
+    type: str = "merged"      # merged | zip
+
+
+@app.get("/api/search/status")
+def api_search_status():
+    status = search.index_status()
+    status["roots"] = load_settings()["known_roots"]
+    return status
+
+
+@app.post("/api/search/index")
+def api_search_index(force: bool = False):
+    roots = load_settings()["known_roots"]
+    return search.build_index(roots, force=force)
+
+
+@app.get("/api/search")
+def api_search(q: str, channel: str = "", limit: int = 30):
+    result = search.search(q, channel=channel or None, limit=max(1, min(limit, 200)))
+    meta = search.file_meta([r["path"] for r in result["results"]])
+    for row in result["results"]:
+        info = meta.get(row["path"], {})
+        row["upload_date"] = info.get("upload_date", "")
+        row["url"] = info.get("url", "")
+        row["char_count"] = info.get("char_count", 0)
+    return result
+
+
+@app.post("/api/search/export")
+def api_search_export(req: ExportRequest):
+    """검색에서 고른 자막만 내보낸다 — AI에 넣을 묶음을 만드는 단계."""
+    if not req.paths:
+        raise HTTPException(400, "내보낼 자막을 선택하세요.")
+    meta = search.file_meta(req.paths)
+    items = [meta[p] for p in req.paths if p in meta]
+    if not items:
+        raise HTTPException(404, "선택한 자막을 찾을 수 없습니다. 색인을 갱신해 보세요.")
+
+    if req.type == "zip":
+        return Response(content=zip_documents(items), media_type="application/zip",
+                        headers=attachment_headers("자막모음.zip"))
+    text = merge_documents(items)
+    return Response(content=text.encode("utf-8"),
+                    media_type="text/plain; charset=utf-8",
+                    headers=attachment_headers("자막모음.txt"))
 
 
 # --- 프런트엔드 ---

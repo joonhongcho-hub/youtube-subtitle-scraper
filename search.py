@@ -22,6 +22,9 @@ INDEX_PATH = os.path.join(INDEX_DIR, "search.db")
 
 # trigram이 색인하는 최소 글자 수
 MIN_FTS_TERM = 3
+# 색인 형식이 바뀌면 올린다. 옛 색인을 그대로 쓰면 없는 컬럼을 조회해
+# 검색이 통째로 죽으므로, 버전이 다르면 말없이 다시 만든다 (전체 2초대).
+SCHEMA_VERSION = 2
 # 검색 의도가 아니라 '요청하는 말'. 남겨두면 어디에나 있어서 순위를 망친다.
 STOPWORDS = {
     "찾아줘", "찾아", "알려줘", "알려", "보여줘", "보여", "추천해줘", "추천",
@@ -31,23 +34,40 @@ STOPWORDS = {
 }
 
 
-def connect():
-    os.makedirs(INDEX_DIR, exist_ok=True)
-    con = sqlite3.connect(INDEX_PATH)
-    con.row_factory = sqlite3.Row
+def _create_tables(con):
     con.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
-            path UNINDEXED, channel, title, body,
+            path UNINDEXED, root, channel, title, body,
             tokenize='trigram'
         )""")
     # 증분 색인 판단용 — 파일이 바뀌었는지만 알면 된다
     con.execute("""
         CREATE TABLE IF NOT EXISTS files (
             path TEXT PRIMARY KEY,
-            mtime REAL, size INTEGER,
+            root TEXT, mtime REAL, size INTEGER,
             channel TEXT, title TEXT, upload_date TEXT, url TEXT,
             char_count INTEGER
         )""")
+
+
+def connect():
+    os.makedirs(INDEX_DIR, exist_ok=True)
+    con = sqlite3.connect(INDEX_PATH)
+    con.row_factory = sqlite3.Row
+    con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+
+    row = con.execute("SELECT value FROM meta WHERE key = 'schema'").fetchone()
+    version = int(row["value"]) if row else 0
+    if version != SCHEMA_VERSION:
+        # 형식이 다르면 통째로 버린다. 남겨두면 없는 컬럼을 조회해 크래시가 난다.
+        con.execute("DROP TABLE IF EXISTS docs")
+        con.execute("DROP TABLE IF EXISTS files")
+        _create_tables(con)
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('schema', ?)",
+                    (str(SCHEMA_VERSION),))
+        con.commit()
+    else:
+        _create_tables(con)
     return con
 
 
@@ -84,6 +104,7 @@ def _fallback_meta(filename):
 def iter_transcripts(roots):
     """저장 폴더들 아래의 자막 파일과 메타를 훑는다."""
     for root in roots:
+        root = os.path.abspath(root)
         if not os.path.isdir(root):
             continue
         for name in sorted(os.listdir(root)):
@@ -95,7 +116,7 @@ def iter_transcripts(roots):
                 if not filename.endswith(".txt"):
                     continue
                 record = meta.get(filename) or _fallback_meta(filename)
-                yield os.path.join(channel_dir, filename), name, record
+                yield os.path.join(channel_dir, filename), root, name, record
 
 
 def build_index(roots, force=False, log=None):
@@ -112,7 +133,7 @@ def build_index(roots, force=False, log=None):
              for row in con.execute("SELECT path, mtime, size FROM files")}
 
     seen, added, updated = set(), 0, 0
-    for path, channel, record in iter_transcripts(roots):
+    for path, root, channel, record in iter_transcripts(roots):
         seen.add(path)
         stat = os.stat(path)
         if known.get(path) == (stat.st_mtime, stat.st_size):
@@ -127,12 +148,13 @@ def build_index(roots, force=False, log=None):
             updated += 1
         else:
             added += 1
-        con.execute("INSERT INTO docs (path, channel, title, body) VALUES (?,?,?,?)",
-                    (path, channel, title, body))
+        con.execute(
+            "INSERT INTO docs (path, root, channel, title, body) VALUES (?,?,?,?,?)",
+            (path, root, channel, title, body))
         con.execute("""INSERT OR REPLACE INTO files
-                       (path, mtime, size, channel, title, upload_date, url, char_count)
-                       VALUES (?,?,?,?,?,?,?,?)""",
-                    (path, stat.st_mtime, stat.st_size, channel, title,
+                       (path, root, mtime, size, channel, title, upload_date, url, char_count)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (path, root, stat.st_mtime, stat.st_size, channel, title,
                      record.get("upload_date", ""), record.get("url", ""), len(body)))
 
     # 지워진 자막은 색인에서도 뺀다 — 남으면 없는 파일을 결과로 준다
@@ -154,13 +176,24 @@ def build_index(roots, force=False, log=None):
             "total": total, "seconds": round(elapsed, 2)}
 
 
-def index_status():
+def index_status(root=None):
+    """색인 현황. root를 주면 그 폴더 안의 채널만 센다."""
     con = connect()
-    total = con.execute("SELECT count(*) FROM files").fetchone()[0]
-    channels = [r["channel"] for r in con.execute(
-        "SELECT channel, count(*) n FROM files GROUP BY channel ORDER BY n DESC")]
+    if root:
+        root = os.path.abspath(root)
+        total = con.execute("SELECT count(*) FROM files WHERE root = ?",
+                            (root,)).fetchone()[0]
+        rows = con.execute("SELECT channel, count(*) n FROM files WHERE root = ? "
+                           "GROUP BY channel ORDER BY n DESC", (root,))
+    else:
+        total = con.execute("SELECT count(*) FROM files").fetchone()[0]
+        rows = con.execute("SELECT channel, count(*) n FROM files "
+                           "GROUP BY channel ORDER BY n DESC")
+    channels = [r["channel"] for r in rows]
+    roots = [r["root"] for r in con.execute(
+        "SELECT root, count(*) n FROM files GROUP BY root ORDER BY n DESC")]
     con.close()
-    return {"total": total, "channels": channels,
+    return {"total": total, "channels": channels, "roots": roots,
             "exists": os.path.exists(INDEX_PATH)}
 
 
@@ -202,7 +235,7 @@ def _rows_to_results(rows, short_terms):
     return results
 
 
-def search(query, channel=None, limit=30):
+def search(query, channel=None, root=None, limit=30):
     """자막을 검색한다. 결과가 비면 조건을 단계적으로 풀고 무엇을 풀었는지 알린다."""
     long_terms, short_terms, words = build_query(query)
     if not words:
@@ -225,8 +258,13 @@ def search(query, channel=None, limit=30):
         if channel:
             where.append("docs.channel = ?")
             params.append(channel)
+        if root:
+            # LIKE로 접두어를 맞추면 안 된다 — 밑줄이 와일드카드라
+            # my_folder 로 거르면 myXfolder 까지 걸린다. 그래서 컬럼 비교를 쓴다.
+            where.append("docs.root = ?")
+            params.append(os.path.abspath(root))
         order = "bm25(docs)" if terms else "docs.rowid"
-        sql = ("SELECT path, channel, title, {} AS score, "
+        sql = ("SELECT path, root, channel, title, {} AS score, "
                "snippet(docs, 3, '«', '»', '…', 14) AS snippet, "
                "substr(body, 1, 4000) AS body_sample "
                "FROM docs WHERE {} ORDER BY score LIMIT ?"

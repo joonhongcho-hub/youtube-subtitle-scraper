@@ -113,6 +113,42 @@ def save_settings(root):
     return load_settings()
 
 
+def add_known_root(root):
+    """검색 대상 폴더만 추가한다. 저장 위치는 건드리지 않는다.
+
+    save_settings()를 쓰면 output_root까지 바뀌어, 검색하려고 폴더를 더했을 뿐인데
+    다음 수집이 그 폴더에 저장되어 버린다.
+    """
+    current = load_settings()
+    roots = [r for r in current["known_roots"] if r != root]
+    storage.save_json(SETTINGS_PATH, {
+        "output_root": current["output_root"],      # 그대로 유지
+        "known_roots": [current["output_root"]] + [root] + [
+            r for r in roots if r != current["output_root"]],
+    })
+    return load_settings()
+
+
+def is_inside_known_root(path):
+    """설정에 등록된 폴더 안인지 확인한다.
+
+    startswith로 비교하면 안 된다 — /a/output 을 기준으로 삼으면
+    /a/output-evil 이 그대로 통과한다. 심볼릭 링크를 푼 뒤 commonpath로 본다.
+    """
+    try:
+        target = os.path.realpath(path)
+    except OSError:
+        return False
+    for root in load_settings()["known_roots"]:
+        try:
+            real_root = os.path.realpath(root)
+            if os.path.commonpath([real_root, target]) == real_root:
+                return True
+        except (OSError, ValueError):   # 다른 드라이브 등
+            continue
+    return False
+
+
 def output_root():
     return load_settings()["output_root"]
 
@@ -387,6 +423,51 @@ def start_thread(job, videos, sleep_multiplier=1.0, skip_done=True):
     return thread
 
 
+def job_out_dir(req):
+    """작업이 저장될 폴더. 미리보기와 실제 작업이 같은 기준을 쓰게 한다."""
+    base = channel.channel_base(req.channel_url)
+    name = req.channel_name or channel.fetch_channel_meta(base)["name"] or "channel"
+    return base, name, channel_dir(name)
+
+
+@app.post("/api/channel/preview")
+def api_preview(req: JobRequest):
+    """지금 선택으로 실제 수집될 개수를 미리 알려준다.
+
+    화면이 따로 더하지 않고 이 값을 그대로 쓴다. 작업을 만들 때와 똑같이
+    collect_targets()를 호출하므로 표시와 실제가 어긋날 수 없다.
+    """
+    base, name, out_dir = job_out_dir(req)
+    req.channel_url = base
+
+    try:
+        targets = collect_targets(req, out_dir)
+    except (RuntimeError, ValueError) as exc:
+        # 미리보기는 화면 숫자일 뿐이다. 실패해도 작업 시작을 막지는 않는다.
+        return {"ok": False, "message": "개수를 계산할 수 없습니다: {}".format(
+            str(exc)[:120])}
+
+    # 이미 받아둔 영상은 수집이 건너뛴다. 실제로 돌 개수를 함께 알려준다.
+    already = 0
+    if os.path.isdir(out_dir):
+        store = engine.Store(out_dir)
+        already = sum(1 for v in targets if store.is_done(v["video_id"]))
+    remaining = len(targets) - already
+
+    shorts = sum(1 for v in targets if v.get("upload_date") in ("", "00000000")
+                 and v.get("duration") is None)
+    return {
+        "ok": True,
+        "count": len(targets),
+        "already": already,
+        "remaining": remaining,
+        "seconds": engine.estimate_seconds(remaining),
+        "unfilterable": shorts,
+        "missing_sort_value": missing_sort_value(targets, req.sort),
+        "limited": bool(req.limit and req.limit > 0 and len(targets) >= req.limit),
+    }
+
+
 @app.post("/api/jobs")
 def api_create_job(req: JobRequest):
     active = jobs.registry.active()
@@ -396,10 +477,8 @@ def api_create_job(req: JobRequest):
             "job_id": active.id,
         })
 
-    base = channel.channel_base(req.channel_url)
+    base, name, out_dir = job_out_dir(req)
     req.channel_url = base
-    name = req.channel_name or channel.fetch_channel_meta(base)["name"] or "channel"
-    out_dir = channel_dir(name)
     os.makedirs(out_dir, exist_ok=True)
 
     try:
@@ -755,6 +834,32 @@ def api_pick_folder():
     return {"cancelled": False, "path": os.path.normpath(path)}
 
 
+@app.post("/api/open-folder")
+def api_open_folder(req: RootRequest):
+    """Finder에서 폴더를 연다. 등록된 폴더 안일 때만 허용한다."""
+    path = os.path.abspath(os.path.expanduser(req.path.strip()))
+    if not is_inside_known_root(path):
+        raise HTTPException(400, "등록된 저장 폴더가 아닙니다.")
+    if not os.path.isdir(path):
+        raise HTTPException(404, "폴더를 찾을 수 없습니다. 옮겼거나 지워졌을 수 있습니다.")
+    try:
+        subprocess.run(["open", path], timeout=10, check=False)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        raise HTTPException(400, "이 시스템에서는 폴더를 열 수 없습니다.")
+    return {"ok": True, "path": path}
+
+
+@app.post("/api/settings/add-root")
+def api_add_root(req: RootRequest):
+    """검색 대상 폴더만 추가한다 (저장 위치는 그대로)."""
+    path = os.path.abspath(os.path.expanduser(req.path.strip()))
+    if not os.path.isdir(path):
+        raise HTTPException(400, "폴더를 찾을 수 없습니다: {}".format(path))
+    settings = add_known_root(path)
+    search.build_index(settings["known_roots"])
+    return settings
+
+
 # --- 자막 검색 ---
 
 class ExportRequest(BaseModel):
@@ -763,9 +868,11 @@ class ExportRequest(BaseModel):
 
 
 @app.get("/api/search/status")
-def api_search_status():
-    status = search.index_status()
-    status["roots"] = load_settings()["known_roots"]
+def api_search_status(root: str = ""):
+    status = search.index_status(root=root or None)
+    # 색인에 아직 없는 폴더도 고를 수 있도록 설정 목록을 합친다
+    known = load_settings()["known_roots"]
+    status["roots"] = known + [r for r in status.get("roots", []) if r not in known]
     return status
 
 
@@ -776,8 +883,9 @@ def api_search_index(force: bool = False):
 
 
 @app.get("/api/search")
-def api_search(q: str, channel: str = "", limit: int = 30):
-    result = search.search(q, channel=channel or None, limit=max(1, min(limit, 200)))
+def api_search(q: str, channel: str = "", root: str = "", limit: int = 30):
+    result = search.search(q, channel=channel or None, root=root or None,
+                           limit=max(1, min(limit, 200)))
     meta = search.file_meta([r["path"] for r in result["results"]])
     for row in result["results"]:
         info = meta.get(row["path"], {})
@@ -815,6 +923,19 @@ def index():
         return HTMLResponse("<h1>준비 중</h1>")
     with open(path, encoding="utf-8") as f:
         return HTMLResponse(f.read())
+
+
+@app.middleware("http")
+async def no_store_for_assets(request, call_next):
+    """화면 파일은 브라우저가 캐시하지 않게 한다.
+
+    Cache-Control이 없으면 브라우저가 알아서 캐시해, 서버를 고쳐도
+    탭을 열어둔 사용자는 옛 화면을 계속 본다. 로컬 도구라 매번 받아도 부담이 없다.
+    """
+    response = await call_next(request)
+    if request.url.path.startswith("/static") or request.url.path == "/":
+        response.headers["Cache-Control"] = "no-store, must-revalidate"
+    return response
 
 
 if os.path.isdir(STATIC_DIR):

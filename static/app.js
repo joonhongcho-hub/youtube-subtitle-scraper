@@ -9,6 +9,8 @@ const state = {
   jobId: null,
   socket: null,
   cursor: 0,
+  outDir: '',
+  preview: null,
   maxStep: 1,         // 여기까지는 자유롭게 오갈 수 있다
 };
 
@@ -34,21 +36,18 @@ function goto(step) {
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
+// 단계 바는 지금 어디까지 왔는지 보여주기만 한다.
+// 다 끝난 작업에서 이전 단계로 되돌아가지는 게 어색해서 이동 기능은 뺐다.
+// 되돌아가는 길은 각 화면의 "← 다른 채널 고르기" 버튼이 맡는다.
 function renderSteps(current) {
-  document.querySelectorAll('#steps .step').forEach((btn) => {
-    const n = Number(btn.dataset.step);
-    const usable = n <= state.maxStep;
-    btn.disabled = !usable || n === current;
-    btn.className = 'step px-3 py-1 rounded-full ' + (
+  document.querySelectorAll('#steps .step').forEach((el) => {
+    const n = Number(el.dataset.step);
+    el.className = 'step px-3 py-1 rounded-full ' + (
       n === current ? 'bg-slate-200 text-slate-700 font-medium'
-      : usable ? 'text-slate-500 hover:bg-slate-100 hover:text-slate-800 cursor-pointer'
-      : 'text-slate-300 cursor-default');
+      : n < current ? 'text-slate-500'
+      : 'text-slate-300');
   });
 }
-
-document.querySelectorAll('#steps .step').forEach((btn) => {
-  btn.addEventListener('click', () => { if (!btn.disabled) goto(Number(btn.dataset.step)); });
-});
 
 async function api(path, options) {
   const res = await fetch(path, options);
@@ -405,13 +404,11 @@ function updateSelection() {
   state.selected = new Set([...document.querySelectorAll('.src:checked')].map((c) => c.value));
   state.selectedPlaylists = new Set([...document.querySelectorAll('.pl:checked')].map((c) => c.value));
 
-  let filterable = 0, unfilterable = 0, seconds = 0;
+  let filterable = 0, unfilterable = 0;
   state.sources.forEach((s) => {
     if (!state.selected.has(s.source)) return;
     if (s.filterable) filterable += s.count; else unfilterable += s.count;
-    seconds += s.seconds;
   });
-  const count = filterable + unfilterable;
 
   // 쇼츠는 유튜브가 업로드일·길이를 주지 않아 필터를 적용할 수 없다.
   // 쇼츠만 고른 경우엔 아예 손대지 못하게 막고, 다른 종류와 섞였으면
@@ -433,22 +430,75 @@ function updateSelection() {
     el.classList.toggle('opacity-50', onlyUnfilterable);
   });
 
-  const limit = Number($('limit').value) || 0;
-  const effective = limit ? Math.min(limit, count) : count;
-  const effectiveSeconds = count ? Math.round(seconds * (effective / count)) : 0;
-
-  const playlistCount = state.selectedPlaylists.size;
-  const breakdown = unfilterable && filterable
-    ? ` <span class="font-normal text-slate-400">(필터 적용 ${formatCount(filterable)} + 쇼츠 ${formatCount(unfilterable)})</span>`
-    : '';
-  $('totalBox').innerHTML = count || playlistCount
-    ? `선택 ${formatCount(effective)}개${limit && count > limit ? ` <span class="font-normal text-slate-400">(${formatCount(count)}개 중 상위 ${formatCount(limit)})</span>` : breakdown}
-       ${playlistCount ? ` + 재생목록 ${playlistCount}개` : ''}
-       · 예상 ${formatDuration(effectiveSeconds)}`
-    : '<span class="text-slate-400 font-normal">영상 종류를 하나 이상 선택하세요.</span>';
-
   renderSortNote(unfilterable);
-  $('startBtn').disabled = !(count || playlistCount);
+
+  const nothing = !state.selected.size && !state.selectedPlaylists.size;
+  $('startBtn').disabled = nothing;
+  if (nothing) {
+    state.preview = null;
+    $('totalBox').innerHTML =
+      '<span class="text-slate-400 font-normal">영상 종류를 하나 이상 선택하세요.</span>';
+    return;
+  }
+  schedulePreview();
+}
+
+// 개수는 화면이 직접 더하지 않는다. 작업을 만들 때 쓰는 함수에 그대로 물어본다.
+// 따로 계산하면 재생목록·필터·중복 제거가 빠져 실제와 어긋난다.
+const PREVIEW_DEBOUNCE_MS = 400;
+let previewTimer = null;
+let previewAbort = null;
+
+function schedulePreview() {
+  clearTimeout(previewTimer);
+  markPreviewPending();
+  previewTimer = setTimeout(fetchPreview, PREVIEW_DEBOUNCE_MS);
+}
+
+function markPreviewPending() {
+  // 숫자를 지우지 않는다. 사라졌다 나타나면 더 불안해 보인다.
+  const note = '<span class="font-normal text-slate-400 text-xs">계산 중…</span>';
+  $('totalBox').innerHTML = state.preview
+    ? renderPreview(state.preview) + ' ' + note
+    : '<span class="text-slate-400 font-normal">개수를 세는 중…</span>';
+}
+
+async function fetchPreview() {
+  if (previewAbort) previewAbort.abort();
+  previewAbort = new AbortController();
+  const body = collectionBody();
+  try {
+    const res = await fetch('/api/channel/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: previewAbort.signal,
+    });
+    if (!res.ok) throw new Error('preview failed');
+    const data = await res.json();
+    if (!data.ok) {
+      $('totalBox').innerHTML =
+        `<span class="text-amber-700 font-normal">${escapeHtml(data.message)}</span>`;
+      return;
+    }
+    state.preview = data;
+    $('totalBox').innerHTML = renderPreview(data);
+    $('startBtn').disabled = data.remaining === 0 && data.count === 0;
+  } catch (err) {
+    if (err.name === 'AbortError') return;    // 더 최신 요청이 뒤따른다
+    $('totalBox').innerHTML =
+      '<span class="text-amber-700 font-normal">개수를 계산하지 못했습니다.</span>';
+  }
+}
+
+function renderPreview(d) {
+  const parts = [`선택 <b>${formatCount(d.count)}개</b>`];
+  if (d.limited) parts.push(`<span class="font-normal text-slate-400">(상위 ${formatCount(d.count)}개로 제한)</span>`);
+  if (d.already) {
+    parts.push(`<span class="font-normal text-slate-500">— 이미 받은 ${formatCount(d.already)}개를 빼면 <b>${formatCount(d.remaining)}개</b></span>`);
+  }
+  parts.push(`<span class="font-normal">· 예상 ${formatDuration(d.seconds)}</span>`);
+  return parts.join(' ');
 }
 
 function renderSortNote(shortsCount) {
@@ -533,15 +583,9 @@ document.querySelectorAll('.calbtn').forEach((btn) => {
 
 $('startBtn').addEventListener('click', startJob);
 
-async function startJob() {
-  const bad = [...document.querySelectorAll('.datefield')].filter((el) => !markDateValidity(el));
-  if (bad.length) {
-    showError('날짜 형식이 올바르지 않습니다. YYYY-MM-DD 형태로 입력하세요.');
-    return;
-  }
-  const btn = $('startBtn');
-  btn.disabled = true; btn.textContent = '준비 중…';
-  const body = {
+// 미리보기와 실제 작업이 완전히 같은 조건을 쓰도록 한 곳에서 만든다
+function collectionBody() {
+  return {
     channel_url: state.channel.url,
     channel_name: state.channel.name,
     sources: [...state.selected],
@@ -556,6 +600,17 @@ async function startJob() {
     sort: $('sort').value,
     limit: Number($('limit').value) || 0,
   };
+}
+
+async function startJob() {
+  const bad = [...document.querySelectorAll('.datefield')].filter((el) => !markDateValidity(el));
+  if (bad.length) {
+    showError('날짜 형식이 올바르지 않습니다. YYYY-MM-DD 형태로 입력하세요.');
+    return;
+  }
+  const btn = $('startBtn');
+  btn.disabled = true; btn.textContent = '준비 중…';
+  const body = collectionBody();
   try {
     const data = await api('/api/jobs', {
       method: 'POST',
@@ -666,6 +721,9 @@ async function showResults() {
       api(`/api/jobs/${state.jobId}?scope=${scope()}`),
       api(`/api/jobs/${state.jobId}/videos?scope=${scope()}`),
     ]);
+    state.outDir = stateData.out_dir || '';
+    $('doneFolder').textContent = state.outDir || '(경로를 알 수 없습니다)';
+    $('openFolderBtn').disabled = !state.outDir;
     renderSummary(stateData.summary);
     renderVideos(videoData.videos);
   } catch (err) {
@@ -730,6 +788,23 @@ function renderVideos(videos) {
     row.addEventListener('click', () => openPreview(row.dataset.vid));
   });
 }
+
+$('openFolderBtn').addEventListener('click', async () => {
+  if (!state.outDir) return;
+  const btn = $('openFolderBtn');
+  btn.disabled = true;
+  try {
+    await api('/api/open-folder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: state.outDir }),
+    });
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 // --- 다운로드 / 미리보기 ---
 
@@ -914,17 +989,61 @@ let findRows = [];
 
 async function loadFindStatus() {
   try {
-    const s = await api('/api/search/status');
+    const root = $('froot').value;
+    const s = await api(`/api/search/status?root=${encodeURIComponent(root)}`);
     $('findStatus').textContent = `색인 ${formatCount(s.total)}개`;
+
+    // 폴더가 하나뿐이면 고를 것이 없으므로 드롭다운을 숨긴다
+    const rootSelect = $('froot');
+    rootSelect.classList.toggle('hidden', (s.roots || []).length < 2);
+    if ((s.roots || []).length >= 2) {
+      const keep = rootSelect.value;
+      rootSelect.innerHTML = '<option value="">전체 폴더</option>' +
+        s.roots.map((r) => `<option value="${escapeHtml(r)}">${escapeHtml(shortPath(r))}</option>`).join('');
+      rootSelect.value = keep;
+    }
+
+    // 폴더를 좁히면 채널 목록도 그 폴더 안의 채널로 바뀐다
     const select = $('fchannel');
     const current = select.value;
     select.innerHTML = '<option value="">전체 채널</option>' +
       s.channels.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
-    select.value = current;
+    select.value = s.channels.includes(current) ? current : '';
   } catch (e) {
     $('findStatus').textContent = '색인 없음';
   }
 }
+
+// 경로가 길어 드롭다운을 넘치므로 뒤쪽 두 칸만 보여준다
+function shortPath(path) {
+  const parts = path.split('/').filter(Boolean);
+  return parts.length <= 2 ? path : '…/' + parts.slice(-2).join('/');
+}
+
+$('froot').addEventListener('change', () => {
+  loadFindStatus();
+  if ($('fq').value.trim()) runFind();
+});
+
+$('addRootBtn').addEventListener('click', async () => {
+  const btn = $('addRootBtn');
+  btn.disabled = true; btn.textContent = '창에서 고르는 중…';
+  try {
+    const picked = await api('/api/pick-folder', { method: 'POST' });
+    if (!picked.cancelled) {
+      await api('/api/settings/add-root', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: picked.path }),
+      });
+      await loadFindStatus();
+    }
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    btn.disabled = false; btn.textContent = '폴더 추가';
+  }
+});
 
 $('reindexBtn').addEventListener('click', async () => {
   const el = $('findStatus');
@@ -947,7 +1066,8 @@ async function runFind() {
   btn.disabled = true; btn.textContent = '검색 중…';
   try {
     const url = `/api/search?q=${encodeURIComponent(q)}`
-      + `&channel=${encodeURIComponent($('fchannel').value)}&limit=50`;
+      + `&channel=${encodeURIComponent($('fchannel').value)}`
+      + `&root=${encodeURIComponent($('froot').value)}&limit=50`;
     const data = await api(url);
     findRows = data.results;
     renderFind(data);

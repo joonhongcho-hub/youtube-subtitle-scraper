@@ -32,10 +32,10 @@
   <div id="collectMode">
   <!-- 단계 표시 -->
   <ol id="steps" class="flex items-center gap-2 text-xs mb-8 text-slate-400">
-    <li><button data-step="1" class="step px-3 py-1 rounded-full">1 채널 입력</button></li>
-    <li>→</li><li><button data-step="2" class="step px-3 py-1 rounded-full">2 수집 범위</button></li>
-    <li>→</li><li><button data-step="3" class="step px-3 py-1 rounded-full">3 실행</button></li>
-    <li>→</li><li><button data-step="4" class="step px-3 py-1 rounded-full">4 다운로드</button></li>
+    <li><span data-step="1" class="step px-3 py-1 rounded-full">1 채널 입력</span></li>
+    <li>→</li><li><span data-step="2" class="step px-3 py-1 rounded-full">2 수집 범위</span></li>
+    <li>→</li><li><span data-step="3" class="step px-3 py-1 rounded-full">3 실행</span></li>
+    <li>→</li><li><span data-step="4" class="step px-3 py-1 rounded-full">4 완료</span></li>
   </ol>
 
   <div id="error" class="hidden mb-6 px-4 py-3 rounded-lg bg-red-50 border border-red-200 text-red-700 text-sm"></div>
@@ -207,6 +207,14 @@
   <!-- [4] 완료 -->
   <section id="screen4" class="hidden">
     <div class="bg-white rounded-xl border border-slate-200 p-6 mb-5">
+      <div class="text-xs text-slate-500 mb-2">자막이 저장된 폴더</div>
+      <div class="flex items-center gap-3 flex-wrap">
+        <code id="doneFolder" class="flex-1 min-w-0 truncate px-3 py-2 rounded bg-slate-50 border border-slate-200 text-xs">…</code>
+        <button id="openFolderBtn" class="px-4 py-2 rounded-lg bg-slate-900 text-white text-sm font-medium hover:bg-slate-700">폴더 열기</button>
+      </div>
+    </div>
+
+    <div class="bg-white rounded-xl border border-slate-200 p-6 mb-5">
       <div class="flex items-start justify-between gap-4 mb-4">
         <div id="summary" class="text-lg font-semibold"></div>
         <label class="flex items-center gap-2 text-xs text-slate-600 shrink-0">
@@ -219,11 +227,12 @@
     </div>
 
     <div class="bg-white rounded-xl border border-slate-200 p-6 mb-5">
-      <h3 class="font-semibold mb-4">다운로드</h3>
-      <div class="flex flex-wrap gap-3">
-        <button class="dl px-5 py-2.5 rounded-lg bg-slate-900 text-white text-sm font-medium hover:bg-slate-700" data-type="zip">전체 ZIP 다운로드</button>
-        <button class="dl px-5 py-2.5 rounded-lg border border-slate-300 text-sm font-medium hover:bg-slate-50" data-type="xlsx">index.xlsx만</button>
-        <button class="dl px-5 py-2.5 rounded-lg border border-slate-300 text-sm font-medium hover:bg-slate-50" data-type="merged">단일 텍스트로 병합</button>
+      <h3 class="text-sm font-semibold text-slate-600 mb-1">따로 받기</h3>
+      <p class="text-xs text-slate-400 mb-3">자막은 이미 위 폴더에 있습니다. 옮기거나 AI에 넣을 때만 쓰세요.</p>
+      <div class="flex flex-wrap gap-2">
+        <button class="dl px-3 py-1.5 rounded border border-slate-300 text-xs hover:bg-slate-50" data-type="zip">ZIP</button>
+        <button class="dl px-3 py-1.5 rounded border border-slate-300 text-xs hover:bg-slate-50" data-type="xlsx">index.xlsx</button>
+        <button class="dl px-3 py-1.5 rounded border border-slate-300 text-xs hover:bg-slate-50" data-type="merged">하나로 합친 텍스트</button>
       </div>
     </div>
 
@@ -255,6 +264,9 @@
         <input id="fq" type="text" autocomplete="off"
                placeholder="찾을 단어를 띄어쓰기로 (예: 창업 수익화 자동매매)"
                class="flex-1 px-4 py-3 rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-slate-400">
+        <select id="froot" class="hidden px-3 py-3 rounded-lg border border-slate-300 text-sm">
+          <option value="">전체 폴더</option>
+        </select>
         <select id="fchannel" class="px-3 py-3 rounded-lg border border-slate-300 text-sm">
           <option value="">전체 채널</option>
         </select>
@@ -266,6 +278,7 @@
         </p>
         <div class="text-xs text-slate-400">
           <span id="findStatus">색인 확인 중…</span>
+          <button id="addRootBtn" class="underline hover:text-slate-700 ml-2">폴더 추가</button>
           <button id="reindexBtn" class="underline hover:text-slate-700 ml-2">색인 갱신</button>
         </div>
       </div>

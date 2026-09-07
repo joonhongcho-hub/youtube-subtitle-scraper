@@ -213,6 +213,8 @@ class Job(object):
             "error": self.error,
             "channel_name": self.channel_name,
             "channel_url": self.channel_url,
+            # 완료 화면이 "폴더 열기"를 하려면 경로를 알아야 한다
+            "out_dir": self.out_dir,
             "done": self.done,
             "total": self.total,
             "elapsed": int(self.elapsed()),

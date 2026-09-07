@@ -12,10 +12,14 @@ import storage
 import subtitle
 
 DEFAULT_LANGS = ["ko", "en"]
-# 요청 사이 랜덤 대기 (IP 차단 방지)
-SLEEP_MIN, SLEEP_MAX = 3.0, 8.0
-# 영상 1개당 평균 처리 시간 — 실측값(725개 수집에서 401개를 2,604초에 처리)
-SECONDS_PER_VIDEO = 6.5
+# 요청 사이 대기 — 고정값이 아니라 응답을 보고 조절한다 (Pacer 참고)
+SLEEP_START = 3.0        # 몸을 풀 때의 간격
+SLEEP_FLOOR = 1.0        # 아무리 잘 돌아도 이보다 촘촘하게는 보내지 않는다
+SLEEP_CEILING = 30.0     # 차단이 이어져도 이보다 더 물러나지는 않는다
+SLEEP_JITTER = 1.5       # 간격에 얹는 랜덤 폭
+SLEEP_STEP_DOWN = 0.25   # 성공 1건마다 줄이는 양
+# 영상 1개당 평균 처리 시간 — 실측 요청 1.3초 + 바닥 대기 1.0~2.5초
+SECONDS_PER_VIDEO = 3.5
 
 # 로그 수준 — 프런트엔드의 색 구분에 그대로 대응한다
 LEVEL_INFO = "info"
@@ -38,15 +42,40 @@ def estimate_seconds(count):
     return int(count * SECONDS_PER_VIDEO)
 
 
-def polite_sleep(multiplier=1.0, cancel=None):
-    """요청 사이 랜덤 대기. 대기 중에도 중지 요청에 바로 반응한다."""
-    remaining = random.uniform(SLEEP_MIN, SLEEP_MAX) * multiplier
-    while remaining > 0:
-        if cancel is not None and cancel.is_set():
-            return
-        step = min(0.5, remaining)
-        time.sleep(step)
-        remaining -= step
+class Pacer(object):
+    """요청 간격을 실제 응답을 보고 조절한다.
+
+    고정 3~8초는 차단을 겪고 정한 값이 아니라 처음에 넉넉히 잡은 추정치였다.
+    실측하면 자막 요청 자체는 1.3초인데 대기가 5.5초라, 영상 1개에 쓰는
+    시간의 78%를 아무것도 하지 않고 보내고 있었다.
+
+    그래서 성공이 이어지면 조금씩 내리고, 차단이 보이면 한 번에 배로 올린다.
+    반대로 하면(빨리 내리고 천천히 올리면) 차단을 반복해서 맞는다.
+    """
+
+    def __init__(self, multiplier=1.0, start=SLEEP_START):
+        self.multiplier = multiplier
+        self.gap = start
+
+    def wait(self, cancel=None):
+        """다음 요청까지 쉰다. 대기 중에도 중지 요청에 바로 반응한다."""
+        # 간격이 일정하면 오히려 자동화로 보이므로 랜덤 폭을 남긴다
+        remaining = random.uniform(
+            self.gap, self.gap + SLEEP_JITTER) * self.multiplier
+        while remaining > 0:
+            if cancel is not None and cancel.is_set():
+                return
+            step = min(0.5, remaining)
+            time.sleep(step)
+            remaining -= step
+
+    def on_success(self):
+        """잘 되면 조금씩 내린다 — 한 번에 내리면 어디가 바닥인지 알 수 없다."""
+        self.gap = max(SLEEP_FLOOR, self.gap - SLEEP_STEP_DOWN)
+
+    def on_blocked(self):
+        """차단이 보이면 즉시 물러난다. 돌아오는 건 성공이 쌓인 뒤다."""
+        self.gap = min(SLEEP_CEILING, max(2.0, self.gap * 2))
 
 
 class Store(object):
@@ -110,6 +139,7 @@ def process_videos(videos, channel_name, store, langs, mode, api,
     """
     log = log or silent_log
     total = len(videos)
+    pacer = Pacer(multiplier=sleep_multiplier)
 
     for i, video in enumerate(videos, 1):
         if cancel is not None and cancel.is_set():
@@ -156,5 +186,17 @@ def process_videos(videos, channel_name, store, langs, mode, api,
         store.update(record)  # 영상 1개마다 즉시 반영
         if on_progress:
             on_progress(i, total, record)
+
+        # 이번 결과를 다음 대기 시간에 반영한다
+        previous_gap = pacer.gap
+        if result.status in (subtitle.RATE_LIMITED, subtitle.TIMEOUT):
+            pacer.on_blocked()
+        elif result.ok:
+            pacer.on_success()
+        # 물러설 때와 바닥에 처음 닿을 때만 알린다 — 매번 찍으면 로그가 지저분하다
+        if abs(pacer.gap - previous_gap) > 0.01 and (
+                pacer.gap > previous_gap or pacer.gap == SLEEP_FLOOR):
+            log(LEVEL_INFO, "      요청 간격 {:.1f}초".format(pacer.gap))
+
         if i < total:
-            polite_sleep(sleep_multiplier, cancel=cancel)
+            pacer.wait(cancel=cancel)

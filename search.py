@@ -102,21 +102,30 @@ def _fallback_meta(filename):
 
 
 def iter_transcripts(roots):
-    """저장 폴더들 아래의 자막 파일과 메타를 훑는다."""
+    """저장 폴더들 아래의 자막 파일과 메타를 훑는다.
+
+    카테고리 폴더를 몇 겹으로 두든 상관없도록 깊이를 정해두지 않고,
+    .txt를 담고 있는 폴더를 채널로 본다. 예전에는 루트/채널/*.txt 두 단계만
+    훑어서, 채널을 카테고리 폴더로 옮기면 그 자막이 통째로 검색에서 사라졌다.
+    """
     for root in roots:
         root = os.path.abspath(root)
         if not os.path.isdir(root):
             continue
-        for name in sorted(os.listdir(root)):
-            channel_dir = os.path.join(root, name)
-            if not os.path.isdir(channel_dir) or name.startswith("_"):
+        for dirpath, dirnames, filenames in os.walk(root):
+            # 내부용 폴더(_index, _jobs, _보관)와 숨김 폴더는 아예 들어가지 않는다
+            dirnames[:] = sorted(d for d in dirnames
+                                 if not d.startswith("_") and not d.startswith("."))
+            if dirpath == root:
                 continue
-            meta = _channel_meta(channel_dir)
-            for filename in sorted(os.listdir(channel_dir)):
-                if not filename.endswith(".txt"):
-                    continue
+            names = sorted(f for f in filenames if f.endswith(".txt"))
+            if not names:
+                continue
+            channel = os.path.basename(dirpath)
+            meta = _channel_meta(dirpath)
+            for filename in names:
                 record = meta.get(filename) or _fallback_meta(filename)
-                yield os.path.join(channel_dir, filename), root, name, record
+                yield os.path.join(dirpath, filename), root, channel, record
 
 
 def build_index(roots, force=False, log=None):

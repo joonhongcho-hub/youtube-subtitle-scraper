@@ -19,6 +19,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 JOBS_DIR = os.path.join(BASE_DIR, "output", "_jobs")
 
 STATUS_RUNNING = "running"
+# 순서를 기다리는 작업 — 앞 작업이 끝나면 감시 스레드가 시작한다
+STATUS_QUEUED = "queued"
 STATUS_DONE = "done"
 STATUS_STOPPED = "stopped"
 STATUS_ERROR = "error"
@@ -50,6 +52,9 @@ class Job(object):
         self.started_at = time.time()
         self.finished_at = None
         self.last_progress_at = time.time()
+        # 대기열에 들어간 시각. 순서는 이 값으로 정한다 — started_at은
+        # 실제로 시작할 때 다시 찍히므로 순서 기준으로 쓸 수 없다.
+        self.queued_at = None
 
         self.logs = []
         self.logs_loaded = False
@@ -86,6 +91,7 @@ class Job(object):
             "total": self.total,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
+            "queued_at": self.queued_at,
         })
 
     @classmethod
@@ -101,7 +107,9 @@ class Job(object):
         job.total = data.get("total", len(job.targets))
         job.started_at = data.get("started_at", time.time())
         job.finished_at = data.get("finished_at")
-        # 실행 중으로 저장됐는데 이 프로세스에는 스레드가 없다 → 중단된 것이다
+        job.queued_at = data.get("queued_at")
+        # 실행 중으로 저장됐는데 이 프로세스에는 스레드가 없다 → 중단된 것이다.
+        # 대기 중이던 작업은 그대로 둔다 — 서버를 다시 띄우면 이어서 차례를 기다린다.
         if job.status == STATUS_RUNNING:
             job.status = STATUS_INTERRUPTED
         return job
@@ -221,15 +229,19 @@ class Job(object):
             "eta": self.eta_seconds(),
             "stalled_minutes": self.stalled_minutes(),
             "log_count": len(self.logs),
+            "queued_at": self.queued_at,
             "resumable": self.status in (
                 STATUS_INTERRUPTED, STATUS_STOPPED, STATUS_ERROR),
         }
 
 
 class Registry(object):
-    """작업 보관소. 동시 실행은 1건으로 제한한다.
+    """작업 보관소. 동시 실행은 1건으로 제한하고 나머지는 줄을 세운다.
 
     유튜브 rate limit 때문에 병렬로 돌리면 오히려 느려지고 429를 부른다.
+    영상 1개에 드는 시간의 대부분이 차단 방지용 대기라, 여러 작업을 겹쳐도
+    요청 빈도만 배로 뛸 뿐 총 시간은 줄지 않기 때문이다.
+    대신 대기열(STATUS_QUEUED)에 넣어두면 앞 작업이 끝나는 대로 이어서 돈다.
     """
 
     def __init__(self):
@@ -269,11 +281,21 @@ class Registry(object):
             job.finish(STATUS_INTERRUPTED)
         return None
 
+    def pending(self):
+        """차례를 기다리는 작업 — 넣은 순서대로."""
+        waiting = [j for j in self.jobs.values() if j.status == STATUS_QUEUED]
+        return sorted(waiting, key=lambda j: j.queued_at or j.started_at)
+
+    def next_queued(self):
+        waiting = self.pending()
+        return waiting[0] if waiting else None
+
     def latest(self):
-        """가장 최근에 시작한 작업."""
-        if not self.jobs:
+        """가장 최근에 시작한 작업. 아직 시작도 안 한 대기 작업은 빼고 본다."""
+        started = [j for j in self.jobs.values() if j.status != STATUS_QUEUED]
+        if not started:
             return None
-        return max(self.jobs.values(), key=lambda j: j.started_at)
+        return max(started, key=lambda j: j.started_at)
 
     def add(self, job):
         with self._lock:

@@ -19,10 +19,21 @@ const TOTAL_STEPS = 4;
 const $ = (id) => document.getElementById(id);
 const SOURCE_LABEL = { videos: '일반 영상', shorts: '쇼츠', streams: '라이브 다시보기' };
 
+const BOX_BASE = 'mb-6 px-4 py-3 rounded-lg border text-sm ';
+
 function showError(message) {
+  showBox(message, 'bg-red-50 border-red-200 text-red-700');
+}
+
+// 잘 된 일도 같은 자리에 알린다 — 색만 다르다
+function showNotice(message) {
+  showBox(message, 'bg-emerald-50 border-emerald-200 text-emerald-800');
+}
+
+function showBox(message, tone) {
   const box = $('error');
   box.textContent = message;
-  box.classList.remove('hidden');
+  box.className = BOX_BASE + tone;
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 function clearError() { $('error').classList.add('hidden'); }
@@ -617,7 +628,14 @@ async function startJob() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    attachJob(data.job_id);
+    if (data.queued) {
+      // 화면을 진행 상황으로 넘기지 않는다 — 지금 도는 건 다른 채널이라
+      // 넘어가면 방금 건 작업이 시작된 것처럼 보인다.
+      showNotice(`대기열 ${data.position}번으로 넣었습니다. 앞 작업이 끝나면 자동으로 시작합니다.`);
+      loadQueue();
+    } else {
+      attachJob(data.job_id);
+    }
   } catch (err) {
     if (err.detail && err.detail.job_id) {
       attachJob(err.detail.job_id);
@@ -629,6 +647,49 @@ async function startJob() {
     btn.disabled = false; btn.textContent = '수집 시작';
   }
 }
+
+// --- 대기열 ---
+
+async function loadQueue() {
+  const bar = $('queueBar');
+  try {
+    const data = await api('/api/queue');
+    if (!data.pending.length) { bar.classList.add('hidden'); return; }
+
+    const running = data.running
+      ? `<div class="mb-2 text-slate-600">지금 <b>${escapeHtml(data.running.channel_name)}</b>
+           ${formatCount(data.running.done)}/${formatCount(data.running.total)} 진행 중</div>`
+      : '';
+    const rows = data.pending.map((j) => `
+      <li class="flex items-center gap-3 py-1">
+        <span class="w-5 text-slate-400 tabular-nums">${j.position}</span>
+        <span class="flex-1 truncate">${escapeHtml(j.channel_name)}</span>
+        <span class="text-slate-400 text-xs tabular-nums">${formatCount(j.total)}개 · 약 ${formatDuration(j.seconds)}</span>
+        <button class="dequeue underline text-xs text-slate-500 hover:text-red-600"
+                data-job="${j.job_id}">빼기</button>
+      </li>`).join('');
+    bar.innerHTML = `${running}<div class="font-medium mb-1">대기 중 ${data.pending.length}개</div>
+      <ul class="divide-y divide-slate-200">${rows}</ul>`;
+    bar.classList.remove('hidden');
+
+    bar.querySelectorAll('.dequeue').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try {
+          await api(`/api/jobs/${btn.dataset.job}/dequeue`, { method: 'POST' });
+        } catch (err) { showError(err.message); }
+        loadQueue();
+      });
+    });
+  } catch (err) {
+    bar.classList.add('hidden');
+  }
+}
+
+// 앞 작업이 끝나 다음 채널이 시작되는 것을 화면이 알아채야 한다.
+// 작업 하나가 몇십 분이라 굳이 촘촘히 볼 필요는 없다.
+setInterval(loadQueue, 5000);
+loadQueue();
 
 function attachJob(jobId) {
   rememberJob(jobId);

@@ -27,6 +27,12 @@ import subtitle
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_ROOT = os.path.join(BASE_DIR, "output")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
+# 결과물은 한곳에 모으고, 그 아래를 카테고리로 나눈다.
+# _index·_jobs 같은 내부 파일과 사람이 보는 자막을 섞어두면 정리할 수가 없다.
+TRANSCRIPT_DIR = "자막"
+UNSORTED_DIR = "미분류"
+# 대기열 감시 주기(초)
+QUEUE_POLL_SECONDS = 3
 
 app = FastAPI(title="유튜브 자막 수집기")
 
@@ -153,9 +159,28 @@ def output_root():
     return load_settings()["output_root"]
 
 
+def find_channel_dir(folder_name):
+    """이미 만들어 둔 채널 폴더를 카테고리 어디에 있든 찾아낸다.
+
+    카테고리로 옮겨둔 채널을 다시 수집할 때 미분류에 새 폴더를 만들면
+    같은 채널의 자막이 두 곳으로 갈라지고, 이미 받은 영상을 처음부터 다시 받는다.
+    """
+    for root in load_settings()["known_roots"]:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, _ in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames
+                                 if not d.startswith("_") and not d.startswith("."))
+            if folder_name in dirnames:
+                return os.path.join(dirpath, folder_name)
+    return None
+
+
 def channel_dir(channel_name):
     """채널별 결과 폴더. 재실행하면 이미 받은 자막을 건너뛰어 이어받는다."""
-    return os.path.join(output_root(), storage.sanitize_filename(channel_name))
+    folder = storage.sanitize_filename(channel_name)
+    return find_channel_dir(folder) or os.path.join(
+        output_root(), TRANSCRIPT_DIR, UNSORTED_DIR, folder)
 
 
 def apply_filters(videos, filters, source):
@@ -468,15 +493,68 @@ def api_preview(req: JobRequest):
     }
 
 
+def queue_supervisor():
+    """대기열을 지키는 스레드 — 앞 작업이 끝나면 다음 작업을 시작한다.
+
+    작업이 끝나는 자리에서 곧바로 다음을 부르지 않는 이유는, 작업이 예외로
+    죽거나 서버가 내려갔다 올라온 경우에도 줄이 이어져야 하기 때문이다.
+    """
+    while True:
+        time.sleep(QUEUE_POLL_SECONDS)
+        try:
+            if jobs.registry.active():
+                continue
+            job = jobs.registry.next_queued()
+            if not job:
+                continue
+            job.cancel = threading.Event()
+            job.status = jobs.STATUS_RUNNING
+            job.started_at = time.time()
+            job.last_progress_at = time.time()
+            job.save()
+            job.log("info", "대기열에서 차례가 되어 시작합니다.")
+            start_thread(job, job.targets)
+        except Exception:   # 감시 스레드는 무슨 일이 있어도 죽으면 안 된다
+            continue
+
+
+@app.on_event("startup")
+def start_queue_supervisor():
+    threading.Thread(target=queue_supervisor, daemon=True).start()
+
+
+@app.get("/api/queue")
+def api_queue():
+    """실행 중인 작업과 뒤에 선 작업들."""
+    active = jobs.registry.active()
+    return {
+        "running": active.state() if active else None,
+        "pending": [
+            {
+                "job_id": job.id,
+                "channel_name": job.channel_name,
+                "total": job.total,
+                "seconds": engine.estimate_seconds(job.total),
+                "position": i + 1,
+            }
+            for i, job in enumerate(jobs.registry.pending())
+        ],
+    }
+
+
+@app.post("/api/jobs/{job_id}/dequeue")
+def api_job_dequeue(job_id: str):
+    """차례를 기다리는 작업을 대기열에서 뺀다."""
+    job = require_job(job_id)
+    if job.status != jobs.STATUS_QUEUED:
+        raise HTTPException(400, "대기 중인 작업이 아닙니다.")
+    job.log("info", "대기열에서 뺐습니다.")
+    job.finish(jobs.STATUS_STOPPED)
+    return {"ok": True}
+
+
 @app.post("/api/jobs")
 def api_create_job(req: JobRequest):
-    active = jobs.registry.active()
-    if active:
-        raise HTTPException(409, {
-            "message": "이미 실행 중인 작업이 있습니다.",
-            "job_id": active.id,
-        })
-
     base, name, out_dir = job_out_dir(req)
     req.channel_url = base
     os.makedirs(out_dir, exist_ok=True)
@@ -489,9 +567,21 @@ def api_create_job(req: JobRequest):
         raise HTTPException(400, "조건에 맞는 영상이 없습니다.")
 
     job = jobs.Job(name, base, out_dir, targets, req.options.dict())
+
+    # 이미 도는 작업이 있으면 막지 않고 줄을 세운다.
+    # 대상 목록은 지금 확정해 둔다 — 대기 중에도 개수를 보여줄 수 있고,
+    # 차례가 왔을 때 채널 목록을 다시 받느라 멈춰 서지 않는다.
+    if jobs.registry.active():
+        job.status = jobs.STATUS_QUEUED
+        job.queued_at = time.time()
+        jobs.registry.add(job)
+        job.log("info", "대기열에 넣었습니다 — 앞 작업이 끝나면 자동으로 시작합니다.")
+        return {"job_id": job.id, "total": job.total, "queued": True,
+                "position": len(jobs.registry.pending())}
+
     jobs.registry.add(job)
     start_thread(job, job.targets)
-    return {"job_id": job.id, "total": job.total}
+    return {"job_id": job.id, "total": job.total, "queued": False, "position": 0}
 
 
 @app.get("/api/jobs/latest")

@@ -157,7 +157,14 @@ def process_videos(videos, channel_name, store, langs, mode, api,
         log(LEVEL_INFO, "[{}/{}] {} — {}".format(
             i, total, video_id, video["title"][:60]))
         result = subtitle.fetch_subtitle(
-            video_id, langs, mode=mode, api=api, log=log, timestamps=timestamps)
+            video_id, langs, mode=mode, api=api, log=log, timestamps=timestamps,
+            cancel=cancel)
+
+        if result.status == subtitle.CANCELLED:
+            # 이 영상은 끝까지 시도하지 못했다 — 실패로 기록하면 안 되므로
+            # store를 건드리지 않고, 영상 사이 취소와 같은 문구로 멈춘다.
+            log(LEVEL_INFO, "중지 요청 — {}개까지 처리하고 멈춥니다.".format(i - 1))
+            break
 
         previous = store.get(video_id) or {}
         record = {

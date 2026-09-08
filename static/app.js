@@ -696,6 +696,7 @@ function attachJob(jobId) {
   state.cursor = 0;
   state.maxStep = Math.max(state.maxStep, 3);
   $('console').innerHTML = '';
+  resetStopBtn();   // 이전 작업에서 눌러둔 중지 버튼 상태가 새 작업까지 남지 않게
   goto(3);
   openSocket();
 }
@@ -759,14 +760,24 @@ function renderProgress(s) {
   } else {
     stall.classList.add('hidden');
   }
+
+  // 작업이 실제로 running을 벗어났으면 중지 버튼을 정상으로 되돌린다.
+  // POST 응답만 보고 바로 되돌리면, 실제로는 아직 안 멈췄는데 버튼만
+  // 멀쩡해 보여 몇 번을 더 눌러야 하는 것처럼 느껴진다.
+  if (s.status !== 'running') resetStopBtn();
+}
+
+function resetStopBtn() {
+  const btn = $('stopBtn');
+  btn.disabled = false; btn.textContent = '중지';
 }
 
 $('stopBtn').addEventListener('click', async () => {
   const btn = $('stopBtn');
   btn.disabled = true; btn.textContent = '중지 중…';
   try { await api(`/api/jobs/${state.jobId}/stop`, { method: 'POST' }); }
-  catch (err) { showError(err.message); }
-  finally { btn.disabled = false; btn.textContent = '중지'; }
+  catch (err) { showError(err.message); resetStopBtn(); }
+  // 성공하면 여기서 되돌리지 않는다 — renderProgress가 실제로 멈춘 뒤 되돌린다.
 });
 
 // --- [4] 완료 ---
@@ -787,6 +798,12 @@ async function showResults() {
     $('openFolderBtn').disabled = !state.outDir;
     renderSummary(stateData.summary);
     renderVideos(videoData.videos);
+
+    // 영상별 성공/실패와 다른 층위의 문제 — 작업 자체가 도중에 죽은 경우다.
+    // goto(4)가 화면을 넘기며 배너를 지우므로, 그 뒤인 여기서 채워야 남는다.
+    if (stateData.status === 'error') {
+      showError(`작업이 중간에 멈췄습니다: ${stateData.error || '알 수 없는 오류'}`);
+    }
   } catch (err) {
     showError(err.message);
   }

@@ -48,11 +48,16 @@ def make_api():
     return YouTubeTranscriptApi(http_client=make_session())
 
 
-def verify_transcript_api(log=None):
+def verify_transcript_api(log=None, cancel=None):
     """[안전장치 B] 본 작업 전 youtube-transcript-api가 실제로 동작하는지 확인한다.
 
     프로브 영상으로 실제 요청을 보내 성공하면 MODE_API,
     모두 실패하면 MODE_YTDLP(단독 경로)로 자동 전환한다.
+
+    cancel이 켜져 있으면 다음 프로브를 시작하지 않는다. 프로브 하나가
+    이미 보낸 요청 자체는 중간에 끊을 수 없지만(최대 40초), 두 개를 연달아
+    기다리는 것보다는 낫다 — 막힌 상태에서는 이 검증만으로 최대 80초가
+    걸려 중지 버튼이 그동안 먹지 않는다.
 
     Returns:
         (mode, sample) — mode는 MODE_API 또는 MODE_YTDLP,
@@ -65,6 +70,8 @@ def verify_transcript_api(log=None):
     errors = []
 
     for video_id, label in PROBE_VIDEO_IDS:
+        if cancel is not None and cancel.is_set():
+            break
         try:
             fetched = api.fetch(video_id, languages=["en", "ko"])
             snippets = list(fetched)
@@ -118,6 +125,9 @@ PRIVATE_VIDEO = "PRIVATE_VIDEO"
 FETCH_FAILED = "FETCH_FAILED"
 RATE_LIMITED = "RATE_LIMITED"
 TIMEOUT = "TIMEOUT"
+# 사용자가 중지를 눌러 도중에 멈춘 것 — 실패가 아니라 "시도하지 않음"이다.
+# RETRYABLE·NON_RETRYABLE 어디에도 넣지 않는다. 다음 실행에서 처음부터 다시 본다.
+CANCELLED = "CANCELLED"
 
 SUCCESS = "OK"
 NON_RETRYABLE = (NO_SUBTITLES, PRIVATE_VIDEO)
@@ -246,7 +256,33 @@ def _pick_vtt(tmpdir, langs, manual_langs):
     return path, actual, kind_of(actual)
 
 
-def fetch_via_ytdlp(video_id, langs, timestamps=False):
+def _run_ytdlp(cmd, cancel=None):
+    """yt-dlp를 실행하고 (returncode, stdout, stderr)를 돌려준다.
+
+    subprocess.run(timeout=180) 한 방으로 기다리면 그 시간 내내 스레드가
+    막혀 중지 버튼이 먹지 않는다. 대신 0.5초씩 끊어 기다리며 그때마다
+    취소·전체 시간 초과를 확인한다. TimeoutExpired 뒤에 communicate()를
+    다시 불러도 이미 받은 출력은 사라지지 않는다 — 공식 문서에 있는 동작이다.
+    """
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+    started = time.time()
+    while True:
+        try:
+            stdout, stderr = proc.communicate(timeout=0.5)
+            return proc.returncode, stdout, stderr, None
+        except subprocess.TimeoutExpired:
+            if cancel is not None and cancel.is_set():
+                proc.kill()
+                proc.communicate()
+                return None, None, None, CANCELLED
+            if time.time() - started > YTDLP_TIMEOUT:
+                proc.kill()
+                proc.communicate()
+                return None, None, None, TIMEOUT
+
+
+def fetch_via_ytdlp(video_id, langs, timestamps=False, cancel=None):
     """yt-dlp 폴백 경로. 자막만 받고 영상은 받지 않는다.
 
     -J --no-simulate 로 자막 파일을 받으면서 메타데이터도 함께 얻는다.
@@ -266,15 +302,15 @@ def fetch_via_ytdlp(video_id, langs, timestamps=False):
             "-J", "--no-simulate",
             "-o", os.path.join(tmpdir, "%(id)s.%(ext)s"), url,
         ]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=YTDLP_TIMEOUT)
-        except subprocess.TimeoutExpired:
+        returncode, stdout, stderr, bail = _run_ytdlp(cmd, cancel=cancel)
+        if bail == CANCELLED:
+            return SubtitleResult(CANCELLED)
+        if bail == TIMEOUT:
             return SubtitleResult(TIMEOUT, detail="yt-dlp 시간 초과")
 
         # stdout에 JSON이 여러 줄 섞여 나올 수 있으므로 줄 단위로 훑는다
         manual_langs = set()
-        for line in proc.stdout.splitlines():
+        for line in stdout.splitlines():
             line = line.strip()
             if not line.startswith("{"):
                 continue
@@ -290,9 +326,9 @@ def fetch_via_ytdlp(video_id, langs, timestamps=False):
         # 파일이 하나라도 받아졌으면 성공으로 본다.
         path, lang, kind = _pick_vtt(tmpdir, langs, manual_langs)
         if path is None:
-            if proc.returncode != 0:
-                reason = _classify_ytdlp_error(proc.stderr)
-                return SubtitleResult(reason, detail=proc.stderr.strip()[:200])
+            if returncode != 0:
+                reason = _classify_ytdlp_error(stderr)
+                return SubtitleResult(reason, detail=stderr.strip()[:200])
             return SubtitleResult(NO_SUBTITLES, detail="자막 파일 없음")
 
         with open(path, encoding="utf-8", errors="replace") as f:
@@ -304,34 +340,59 @@ def fetch_via_ytdlp(video_id, langs, timestamps=False):
                           source="yt-dlp/" + kind)
 
 
-def _fetch_once(video_id, langs, mode, api, timestamps=False):
+def _fetch_once(video_id, langs, mode, api, timestamps=False, cancel=None):
     """한 번의 수집 시도 — transcript-api 실패 시 yt-dlp로 폴백."""
     if mode != MODE_API:
-        return fetch_via_ytdlp(video_id, langs, timestamps=timestamps)
+        return fetch_via_ytdlp(video_id, langs, timestamps=timestamps, cancel=cancel)
 
     result = fetch_via_api(video_id, langs, api=api, timestamps=timestamps)
     if result.ok or result.status == PRIVATE_VIDEO:
         return result
+    if cancel is not None and cancel.is_set():
+        return SubtitleResult(CANCELLED)
     # NO_SUBTITLES 포함 — transcript-api가 못 봐도 yt-dlp는 볼 수 있다
-    fallback = fetch_via_ytdlp(video_id, langs, timestamps=timestamps)
+    fallback = fetch_via_ytdlp(video_id, langs, timestamps=timestamps, cancel=cancel)
     if fallback.ok:
         return fallback
     # 두 경로 모두 실패하면 더 구체적인 사유를 남긴다
     return fallback if fallback.status != FETCH_FAILED else result
 
 
+def _cancellable_sleep(seconds, cancel):
+    """seconds만큼 쉬되 0.5초마다 취소를 확인한다."""
+    remaining = seconds
+    while remaining > 0:
+        if cancel is not None and cancel.is_set():
+            return
+        step = min(0.5, remaining)
+        time.sleep(step)
+        remaining -= step
+
+
 def fetch_subtitle(video_id, langs, mode=MODE_API, api=None, log=None,
-                   timestamps=False):
+                   timestamps=False, cancel=None):
     """자막 수집 진입점.
 
     429 등 차단 응답이면 exponential backoff(1초 → 2초 → 4초)로 재시도한다.
+    cancel이 켜지면 즉시 CANCELLED를 돌려준다 — 재시도·yt-dlp 도중이라도
+    최대 0.5초 안에 알아챈다. yt-dlp가 subprocess.run(timeout=180) 한 방으로
+    막혀 있던 예전에는 중지 버튼이 몇 분씩 먹지 않았다.
     """
     log = log or (lambda level, message: None)
-    result = _fetch_once(video_id, langs, mode, api, timestamps=timestamps)
+    if cancel is not None and cancel.is_set():
+        return SubtitleResult(CANCELLED)
+
+    result = _fetch_once(video_id, langs, mode, api, timestamps=timestamps,
+                         cancel=cancel)
     for delay in BACKOFF_SECONDS:
+        if result.status == CANCELLED:
+            return result
         if result.status not in (RATE_LIMITED, TIMEOUT):
             break
         log("fail", "      {} — {}초 후 재시도".format(result.status, delay))
-        time.sleep(delay)
-        result = _fetch_once(video_id, langs, mode, api, timestamps=timestamps)
+        _cancellable_sleep(delay, cancel)
+        if cancel is not None and cancel.is_set():
+            return SubtitleResult(CANCELLED)
+        result = _fetch_once(video_id, langs, mode, api, timestamps=timestamps,
+                             cancel=cancel)
     return result

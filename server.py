@@ -413,7 +413,7 @@ def run_collection(job, videos, sleep_multiplier=1.0, skip_done=True):
                  if x.strip()]
         store = engine.Store(job.out_dir)
 
-        mode, _ = subtitle.verify_transcript_api(log=job.log)
+        mode, _ = subtitle.verify_transcript_api(log=job.log, cancel=job.cancel)
         api = subtitle.make_api() if mode == subtitle.MODE_API else None
 
         engine.process_videos(

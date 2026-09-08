@@ -11,11 +11,29 @@ const state = {
   cursor: 0,
   outDir: '',
   preview: null,
+  flow: 'channel',    // 'channel' | 'video' — 단계 표시줄의 라벨이 갈린다
+  mode: 'collect',
   maxStep: 1,         // 여기까지는 자유롭게 오갈 수 있다
 };
 
 const LAST_JOB_KEY = 'ytsub.lastJobId';
 const TOTAL_STEPS = 4;
+
+// 두 수집 흐름은 실행·완료 화면(screen3·screen4)을 공유하고 앞 단계만 다르다.
+// 단계 표시줄은 여기 적힌 라벨을 그대로 그린다.
+const FLOWS = {
+  channel: [
+    { screen: 1, label: '채널 입력' },
+    { screen: 2, label: '수집 범위' },
+    { screen: 3, label: '실행' },
+    { screen: 4, label: '완료' },
+  ],
+  video: [
+    { screen: 'V', label: '링크 입력' },
+    { screen: 3, label: '실행' },
+    { screen: 4, label: '완료' },
+  ],
+};
 const $ = (id) => document.getElementById(id);
 const SOURCE_LABEL = { videos: '일반 영상', shorts: '쇼츠', streams: '라이브 다시보기' };
 
@@ -38,12 +56,23 @@ function showBox(message, tone) {
 }
 function clearError() { $('error').classList.add('hidden'); }
 
-function goto(step) {
+// 실행·완료 화면은 두 흐름이 함께 쓰므로 앞 단계 화면과 컨테이너가 다르다.
+// goto()는 어느 흐름이든 "이 화면 하나만 보인다"를 지키는 역할만 한다.
+function goto(screen) {
   clearError();
-  state.maxStep = Math.max(state.maxStep, step);
+  if (typeof screen === 'number') state.maxStep = Math.max(state.maxStep, screen);
+
   for (let i = 1; i <= TOTAL_STEPS; i++) $('screen' + i).classList.add('hidden');
-  $('screen' + step).classList.remove('hidden');
-  renderSteps(step);
+  $('screenV').classList.add('hidden');
+  $('screen' + screen).classList.remove('hidden');
+
+  // 앞 단계는 흐름별 컨테이너에, 실행·완료는 공용 컨테이너에 들어 있다
+  const onRun = screen === 3 || screen === 4;
+  $('runMode').classList.toggle('hidden', !onRun);
+  $('collectMode').classList.toggle('hidden', onRun || state.flow !== 'channel');
+  $('videoMode').classList.toggle('hidden', onRun || state.flow !== 'video');
+
+  renderSteps(screen);
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
@@ -51,13 +80,15 @@ function goto(step) {
 // 다 끝난 작업에서 이전 단계로 되돌아가지는 게 어색해서 이동 기능은 뺐다.
 // 되돌아가는 길은 각 화면의 "← 다른 채널 고르기" 버튼이 맡는다.
 function renderSteps(current) {
-  document.querySelectorAll('#steps .step').forEach((el) => {
-    const n = Number(el.dataset.step);
-    el.className = 'step px-3 py-1 rounded-full ' + (
-      n === current ? 'bg-slate-200 text-slate-700 font-medium'
-      : n < current ? 'text-slate-500'
-      : 'text-slate-300');
-  });
+  const steps = FLOWS[state.flow];
+  const at = steps.findIndex((s) => String(s.screen) === String(current));
+  $('steps').innerHTML = steps.map((s, i) => {
+    const tone = i === at ? 'bg-slate-200 text-slate-700 font-medium'
+      : i < at ? 'text-slate-500' : 'text-slate-300';
+    const arrow = i ? '<li>→</li>' : '';
+    return `${arrow}<li><span class="step px-3 py-1 rounded-full ${tone}">${i + 1} ${s.label}</span></li>`;
+  }).join('');
+  $('steps').classList.toggle('hidden', at < 0);
 }
 
 async function api(path, options) {
@@ -133,12 +164,15 @@ function renderResumeBar(job) {
   bar.classList.remove('hidden');
 
   const view = $('resumeView');
-  if (view) view.addEventListener('click', () => { attachJob(job.job_id); hideResumeBar(); });
+  if (view) view.addEventListener('click', () => {
+    attachJob(job.job_id, job.kind);
+    hideResumeBar();
+  });
   const result = $('resumeResult');
   if (result) result.addEventListener('click', () => {
     state.jobId = job.job_id;
     state.maxStep = TOTAL_STEPS;
-    showResults();
+    showResults(job.kind);
     hideResumeBar();
   });
   const run = $('resumeRun');
@@ -146,7 +180,7 @@ function renderResumeBar(job) {
     run.disabled = true; run.textContent = '시작 중…';
     try {
       await api(`/api/jobs/${job.job_id}/resume`, { method: 'POST' });
-      attachJob(job.job_id);
+      attachJob(job.job_id, job.kind);
       hideResumeBar();
     } catch (err) {
       showError(err.message);
@@ -650,55 +684,243 @@ async function startJob() {
 
 // --- 대기열 ---
 
+// 상단 요약 — 돌고 있거나 줄 서 있는 게 있으면 어느 탭에서든 한 줄로 알린다.
+// 예전에는 대기 중인 게 있을 때만 떠서, 채널 하나만 돌 때는 아무 표시가 없었다.
 async function loadQueue() {
   const bar = $('queueBar');
   try {
     const data = await api('/api/queue');
-    if (!data.pending.length) { bar.classList.add('hidden'); return; }
+    const r = data.running;
+    if (!r && !data.pending.length) { bar.classList.add('hidden'); return; }
 
-    const running = data.running
-      ? `<div class="mb-2 text-slate-600">지금 <b>${escapeHtml(data.running.channel_name)}</b>
-           ${formatCount(data.running.done)}/${formatCount(data.running.total)} 진행 중</div>`
-      : '';
-    const rows = data.pending.map((j) => `
-      <li class="flex items-center gap-3 py-1">
-        <span class="w-5 text-slate-400 tabular-nums">${j.position}</span>
-        <span class="flex-1 truncate">${escapeHtml(j.channel_name)}</span>
-        <span class="text-slate-400 text-xs tabular-nums">${formatCount(j.total)}개 · 약 ${formatDuration(j.seconds)}</span>
-        <button class="dequeue underline text-xs text-slate-500 hover:text-red-600"
-                data-job="${j.job_id}">빼기</button>
-      </li>`).join('');
-    bar.innerHTML = `${running}<div class="font-medium mb-1">대기 중 ${data.pending.length}개</div>
-      <ul class="divide-y divide-slate-200">${rows}</ul>`;
+    const pct = r && r.total ? Math.round((r.done / r.total) * 100) : 0;
+    const running = r
+      ? `<span class="text-slate-700">지금 <b>${escapeHtml(r.label || r.channel_name)}</b>
+           ${formatCount(r.done)}/${formatCount(r.total)} (${pct}%)</span>`
+      : '<span class="text-slate-500">실행 중인 작업 없음</span>';
+    const waiting = data.pending.length
+      ? `<span class="text-slate-500">· 대기 ${data.pending.length}개</span>` : '';
+
+    bar.innerHTML = `<div class="flex items-center gap-2 flex-wrap">
+      ${running} ${waiting}
+      <span class="flex-1"></span>
+      <button id="queueGo" class="text-xs underline text-slate-500 hover:text-slate-800">대기열 보기</button>
+    </div>`;
     bar.classList.remove('hidden');
-
-    bar.querySelectorAll('.dequeue').forEach((btn) => {
-      btn.addEventListener('click', async () => {
-        btn.disabled = true;
-        try {
-          await api(`/api/jobs/${btn.dataset.job}/dequeue`, { method: 'POST' });
-        } catch (err) { showError(err.message); }
-        loadQueue();
-      });
-    });
+    $('queueGo').addEventListener('click', () => setMode('queue'));
   } catch (err) {
     bar.classList.add('hidden');
   }
 }
 
+// --- 개별 영상 ---
+
+let resolved = null;   // 확인한 결과 — 시작 버튼이 이걸 보고 열린다
+
+$('vcheckBtn').addEventListener('click', resolveVideos);
+
+async function resolveVideos() {
+  const text = $('vurls').value.trim();
+  if (!text) { showError('영상 링크를 넣어주세요.'); return; }
+  const btn = $('vcheckBtn');
+  btn.disabled = true; btn.textContent = '확인 중…';
+  try {
+    const data = await api('/api/videos/resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    resolved = data;
+    renderResolved(data);
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    btn.disabled = false; btn.textContent = '확인';
+  }
+}
+
+function renderResolved(data) {
+  const box = $('vresult');
+  const groups = data.groups.map((g) => `
+    <div class="mb-4">
+      <div class="flex items-baseline gap-2 mb-2">
+        <span class="font-medium text-sm">${escapeHtml(g.channel_name)}</span>
+        <span class="text-xs text-slate-400">${formatCount(g.videos.length)}개${
+          g.already ? ` · 이미 받음 ${formatCount(g.already)}개` : ''}</span>
+      </div>
+      <ul class="space-y-1">${g.videos.map((v) => `
+        <li class="flex items-center gap-2 text-sm">
+          <span class="text-xs text-slate-400 tabular-nums w-20 shrink-0">${
+            v.upload_date === '00000000' ? '—' : escapeHtml(v.upload_date)}</span>
+          <span class="flex-1 min-w-0 truncate">${escapeHtml(v.title)}</span>
+          ${v.already ? '<span class="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-500 shrink-0">이미 받음</span>' : ''}
+        </li>`).join('')}</ul>
+    </div>`).join('');
+
+  // 어떤 링크가 왜 빠졌는지 알아야 고칠 수 있으므로 실패한 링크를 그대로 보여준다
+  const failed = data.failed.length ? `
+    <div class="mt-4 p-3 rounded-lg bg-amber-50 border border-amber-200">
+      <div class="text-xs font-medium text-amber-800 mb-1">해석하지 못한 링크 ${data.failed.length}개</div>
+      <ul class="text-xs text-amber-700 font-mono space-y-0.5">${
+        data.failed.map((u) => `<li class="truncate">${escapeHtml(u)}</li>`).join('')}</ul>
+    </div>` : '';
+
+  box.innerHTML = data.groups.length ? `
+    ${groups}${failed}
+    <div class="flex items-center gap-4 mt-5 pt-4 border-t border-slate-200 flex-wrap">
+      <button id="vstartBtn" class="px-6 py-3 rounded-lg bg-slate-900 text-white font-medium hover:bg-slate-700 disabled:opacity-40">수집 시작</button>
+      <span class="text-sm text-slate-500">받을 영상 <b>${formatCount(data.remaining)}개</b>
+        <span class="text-slate-400">· 예상 ${formatDuration(data.seconds)}</span></span>
+    </div>` : `<p class="text-sm text-slate-500">받을 수 있는 영상이 없습니다.</p>${failed}`;
+  box.classList.remove('hidden');
+
+  const start = $('vstartBtn');
+  if (start) start.addEventListener('click', startVideoJobs);
+}
+
+async function startVideoJobs() {
+  const btn = $('vstartBtn');
+  btn.disabled = true; btn.textContent = '준비 중…';
+  try {
+    const data = await api('/api/videos/jobs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: $('vurls').value.trim() }),
+    });
+    const started = data.jobs.find((j) => !j.queued);
+    const queued = data.jobs.filter((j) => j.queued);
+
+    // 채널이 여럿이면 작업도 채널 수만큼 생긴다 — 첫 작업을 보여주고
+    // 나머지는 대기열로 갔다고 알린다.
+    if (started) {
+      attachJob(started.job_id, 'videos');
+      if (queued.length) {
+        showNotice(`${queued.length}개 채널은 대기열에 넣었습니다. 앞 작업이 끝나면 이어서 시작합니다.`);
+      }
+    } else {
+      showNotice(`대기열에 ${data.jobs.length}개를 넣었습니다. 앞 작업이 끝나면 자동으로 시작합니다.`);
+      loadQueue();
+    }
+  } catch (err) {
+    showError(err.message);
+    btn.disabled = false; btn.textContent = '수집 시작';
+  }
+}
+
+// --- 대기열 탭 ---
+
+const QUEUE_BADGE = {
+  running: ['진행 중', 'bg-blue-100 text-blue-800'],
+  queued: ['대기', 'bg-amber-100 text-amber-800'],
+  done: ['완료', 'bg-emerald-100 text-emerald-800'],
+  stopped: ['중지됨', 'bg-slate-200 text-slate-600'],
+  error: ['오류', 'bg-red-100 text-red-700'],
+  interrupted: ['끊김', 'bg-slate-200 text-slate-600'],
+};
+
+function queueRow(job, status, extra) {
+  const [text, tone] = QUEUE_BADGE[status] || [status, 'bg-slate-100 text-slate-600'];
+  const pct = job.total ? Math.round(((job.done || 0) / job.total) * 100) : 0;
+  const kind = job.kind === 'videos' ? '개별 영상' : '채널';
+  return `
+    <div class="qrow border border-slate-200 rounded-lg p-3 hover:bg-slate-50 cursor-pointer"
+         data-job="${job.job_id}" data-status="${status}" data-kind="${job.kind || 'channel'}">
+      <div class="flex items-center gap-3">
+        <span class="px-2 py-0.5 rounded text-xs shrink-0 ${tone}">${text}</span>
+        <span class="flex-1 min-w-0 truncate text-sm">${escapeHtml(job.label || job.channel_name)}</span>
+        <span class="text-xs text-slate-400 shrink-0">${kind}</span>
+        <span class="text-xs text-slate-500 tabular-nums shrink-0">${formatCount(job.done || 0)}/${formatCount(job.total)}</span>
+        ${extra || ''}
+      </div>
+      ${status === 'running' ? `<div class="h-1.5 bg-slate-200 rounded-full overflow-hidden mt-2">
+        <div class="h-full bg-slate-900" style="width:${pct}%"></div></div>` : ''}
+    </div>`;
+}
+
+async function loadQueuePage() {
+  const box = $('queueList');
+  try {
+    const data = await api('/api/queue');
+    const parts = [];
+
+    if (data.running) {
+      const eta = data.running.eta == null ? '' :
+        `<span class="text-xs text-slate-400 shrink-0">남은 ${formatDuration(data.running.eta)}</span>`;
+      parts.push(queueRow(data.running, 'running', eta));
+    }
+    data.pending.forEach((j) => {
+      parts.push(queueRow({ ...j, done: 0 }, 'queued',
+        `<button class="dequeue text-xs underline text-slate-500 hover:text-red-600 shrink-0"
+                 data-job="${j.job_id}">빼기</button>`));
+    });
+
+    if (!parts.length) {
+      parts.push('<p class="text-sm text-slate-400 py-4">진행 중이거나 기다리는 작업이 없습니다.</p>');
+    }
+    if (data.recent.length) {
+      parts.push('<h4 class="text-xs font-medium text-slate-400 pt-4">최근 끝난 작업</h4>');
+      data.recent.forEach((j) => parts.push(queueRow(j, j.status)));
+    }
+    box.innerHTML = parts.join('');
+
+    // 행을 누르면 그 작업 화면으로 — 진행 중이면 실행 화면, 끝났으면 완료 화면
+    box.querySelectorAll('.qrow').forEach((row) => {
+      row.addEventListener('click', (e) => {
+        if (e.target.classList.contains('dequeue')) return;
+        const jobId = row.dataset.job;
+        const kind = row.dataset.kind;
+        if (row.dataset.status === 'running') {
+          attachJob(jobId, kind);
+        } else {
+          rememberJob(jobId);
+          state.maxStep = TOTAL_STEPS;
+          showResults(kind);
+        }
+      });
+    });
+
+    box.querySelectorAll('.dequeue').forEach((btn) => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        btn.disabled = true;
+        try {
+          await api(`/api/jobs/${btn.dataset.job}/dequeue`, { method: 'POST' });
+        } catch (err) { showError(err.message); }
+        loadQueuePage();
+        loadQueue();
+      });
+    });
+  } catch (err) {
+    box.innerHTML = `<p class="text-sm text-red-600">대기열을 불러오지 못했습니다: ${escapeHtml(err.message)}</p>`;
+  }
+}
+
 // 앞 작업이 끝나 다음 채널이 시작되는 것을 화면이 알아채야 한다.
 // 작업 하나가 몇십 분이라 굳이 촘촘히 볼 필요는 없다.
-setInterval(loadQueue, 5000);
+setInterval(() => {
+  loadQueue();
+  if (state.mode === 'queue') loadQueuePage();
+}, 5000);
 loadQueue();
 
-function attachJob(jobId) {
+function attachJob(jobId, kind) {
   rememberJob(jobId);
   state.cursor = 0;
   state.maxStep = Math.max(state.maxStep, 3);
   $('console').innerHTML = '';
   resetStopBtn();   // 이전 작업에서 눌러둔 중지 버튼 상태가 새 작업까지 남지 않게
+  enterRunFlow(kind);
   goto(3);
   openSocket();
+}
+
+// 실행·완료 화면은 두 흐름이 함께 쓴다. 작업 종류에 맞는 흐름으로 맞추고
+// 검색·대기열 탭에서 들어왔다면 탭 표시도 그 수집 탭으로 옮긴다.
+function enterRunFlow(kind) {
+  if (kind) state.flow = kind === 'videos' ? 'video' : 'channel';
+  $('queueMode').classList.add('hidden');
+  $('findMode').classList.add('hidden');
+  highlightTabs(state.flow === 'video' ? 'video' : 'collect');
 }
 
 const LEVEL_COLOR = { ok: 'text-emerald-400', fail: 'text-red-400', skip: 'text-zinc-500', info: 'text-zinc-300' };
@@ -786,7 +1008,8 @@ $('scopeAll').addEventListener('change', showResults);
 
 function scope() { return $('scopeAll').checked ? 'channel' : 'job'; }
 
-async function showResults() {
+async function showResults(kind) {
+  enterRunFlow(kind);
   goto(4);
   try {
     const [stateData, videoData] = await Promise.all([
@@ -951,8 +1174,10 @@ $('modal').addEventListener('click', (e) => {
 document.querySelectorAll('.back').forEach((btn) => {
   btn.addEventListener('click', () => {
     const target = Number(btn.dataset.to);
-    if (target === 1) resetForNewChannel();
-    goto(target);
+    if (target !== 1) { goto(target); return; }
+    resetForNewChannel();
+    // 개별 영상 흐름에서 "처음으로"는 링크 입력 화면이다
+    goto(state.flow === 'video' ? 'V' : 1);
   });
 });
 
@@ -974,24 +1199,54 @@ function resetForNewChannel() {
   document.querySelectorAll('.datefield').forEach((el) => { el.value = ''; });
   $('minMin').value = '';
   $('maxMin').value = '';
+  // 확인해둔 영상 목록은 이미 시작한 것이라 남겨두면 헷갈린다
+  resolved = null;
+  $('vresult').classList.add('hidden');
 }
 
-renderSteps(1);
+goto(1);
 checkPreviousJob();
 
-// --- 수집 / 검색 모드 전환 ---
+// --- 탭 전환 ---
 
+// 탭마다 어떤 흐름으로 돌아가는지. 수집 탭 둘은 마지막으로 보던 단계로 돌아간다.
 function setMode(mode) {
   clearError();
-  $('collectMode').classList.toggle('hidden', mode !== 'collect');
+  state.mode = mode;
+  const collecting = mode === 'collect' || mode === 'video';
+
+  $('queueMode').classList.toggle('hidden', mode !== 'queue');
   $('findMode').classList.toggle('hidden', mode !== 'find');
+  if (collecting) {
+    const wantFlow = mode === 'video' ? 'video' : 'channel';
+    // 실행·완료 화면은 두 흐름이 함께 쓴다. 지금 그 화면에 있는 작업이 이 탭의
+    // 흐름일 때만 이어서 보여주고, 다른 흐름이면 이 탭의 첫 화면부터 시작한다.
+    const done = !$('screen4').classList.contains('hidden');
+    const onRun = state.flow === wantFlow
+      && (done || !$('screen3').classList.contains('hidden'));
+    state.flow = wantFlow;
+    if (onRun) goto(done ? 4 : 3);
+    else goto(wantFlow === 'video' ? 'V' : 1);
+  } else {
+    ['collectMode', 'videoMode', 'runMode'].forEach((id) => $(id).classList.add('hidden'));
+    $('steps').classList.add('hidden');
+  }
+
+  highlightTabs(mode);
+  if (mode === 'find') loadFindStatus();
+  if (mode === 'queue') loadQueuePage();
+}
+
+// 대기열에서 작업을 열면 화면은 바뀌는데 탭 표시는 그대로라 어디에 있는지
+// 헷갈린다. 화면을 옮기는 쪽에서 탭 표시만 따로 맞춰준다.
+function highlightTabs(mode) {
+  state.mode = mode;
   document.querySelectorAll('.mode').forEach((btn) => {
     const on = btn.dataset.mode === mode;
     btn.className = 'mode px-4 py-2 text-sm font-medium border-b-2 ' + (on
       ? 'border-slate-900 text-slate-900'
       : 'border-transparent text-slate-400 hover:text-slate-700');
   });
-  if (mode === 'find') loadFindStatus();
 }
 
 document.querySelectorAll('.mode').forEach((btn) => {

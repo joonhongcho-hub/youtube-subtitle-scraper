@@ -30,13 +30,18 @@ STATUS_INTERRUPTED = "interrupted"
 # 로그가 무한정 쌓이지 않도록 상한을 둔다 (영상 725개면 2천 줄 남짓)
 MAX_LOG_LINES = 20000
 
+# 작업 종류 — 대기열에서 무엇을 받고 있는지 구분해 보여주기 위한 것
+KIND_CHANNEL = "channel"
+KIND_VIDEOS = "videos"
+
 
 class Job(object):
     """수집 작업 하나. 백그라운드 스레드가 채우고 WebSocket이 읽는다."""
 
     def __init__(self, channel_name, channel_url, out_dir, targets, options,
-                 job_id=None):
+                 job_id=None, kind=KIND_CHANNEL):
         self.id = job_id or uuid.uuid4().hex[:12]
+        self.kind = kind
         self.channel_name = channel_name
         self.channel_url = channel_url
         self.out_dir = out_dir
@@ -66,6 +71,19 @@ class Job(object):
     def video_ids(self):
         return [v["video_id"] for v in self.targets]
 
+    @property
+    def label(self):
+        """대기열에 보여줄 이름.
+
+        개별 영상 작업은 채널명만 띄우면 무엇을 받는 중인지 알 수 없다.
+        하나면 그 영상 제목을, 여럿이면 채널명과 개수를 함께 보여준다.
+        """
+        if self.kind != KIND_VIDEOS:
+            return self.channel_name
+        if len(self.targets) == 1:
+            return self.targets[0].get("title") or self.channel_name
+        return "{} · 영상 {}개".format(self.channel_name, len(self.targets))
+
     # --- 디스크 ---
 
     @property
@@ -80,6 +98,7 @@ class Job(object):
         """메타를 저장한다. 자막과 처리 기록은 채널 폴더에 따로 있다."""
         storage.save_json(self.meta_path, {
             "job_id": self.id,
+            "kind": self.kind,
             "channel_name": self.channel_name,
             "channel_url": self.channel_url,
             "out_dir": self.out_dir,
@@ -100,7 +119,9 @@ class Job(object):
             data = json.load(f)
         job = cls(data["channel_name"], data["channel_url"], data["out_dir"],
                   data.get("targets") or [], data.get("options") or {},
-                  job_id=data["job_id"])
+                  job_id=data["job_id"],
+                  # kind는 나중에 생긴 필드다. 없으면 채널 작업으로 본다.
+                  kind=data.get("kind") or KIND_CHANNEL)
         job.status = data.get("status", STATUS_INTERRUPTED)
         job.error = data.get("error")
         job.done = data.get("done", 0)
@@ -219,6 +240,8 @@ class Job(object):
             "job_id": self.id,
             "status": self.status,
             "error": self.error,
+            "kind": self.kind,
+            "label": self.label,
             "channel_name": self.channel_name,
             "channel_url": self.channel_url,
             # 완료 화면이 "폴더 열기"를 하려면 경로를 알아야 한다

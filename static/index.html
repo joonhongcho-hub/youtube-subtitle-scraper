@@ -20,29 +20,27 @@
     <p class="text-sm text-slate-500 mt-1">채널의 모든 영상 자막을 모아 텍스트와 엑셀로 내려받습니다.</p>
   </header>
 
-  <!-- 수집 / 검색 -->
+  <!-- 수집 / 개별 영상 / 대기열 / 검색 -->
   <div class="flex gap-1 mb-6 border-b border-slate-200">
     <button data-mode="collect" class="mode px-4 py-2 text-sm font-medium border-b-2">자막 수집</button>
+    <button data-mode="video" class="mode px-4 py-2 text-sm font-medium border-b-2">개별 영상</button>
+    <button data-mode="queue" class="mode px-4 py-2 text-sm font-medium border-b-2">대기열</button>
     <button data-mode="find" class="mode px-4 py-2 text-sm font-medium border-b-2">자막 검색</button>
   </div>
 
   <!-- 이전 작업 복구 배너 -->
   <div id="resumeBar" class="hidden mb-6 px-4 py-3 rounded-lg border flex items-center gap-4 flex-wrap"></div>
 
-  <!-- 대기열 — 줄 선 채널이 있을 때만 보인다 -->
+  <!-- 대기열 요약 — 돌고 있는 작업이 있으면 어느 탭에서든 보인다 -->
   <div id="queueBar" class="hidden mb-6 px-4 py-3 rounded-lg bg-slate-50 border border-slate-200 text-sm"></div>
 
-  <div id="collectMode">
-  <!-- 단계 표시 -->
-  <ol id="steps" class="flex items-center gap-2 text-xs mb-8 text-slate-400">
-    <li><span data-step="1" class="step px-3 py-1 rounded-full">1 채널 입력</span></li>
-    <li>→</li><li><span data-step="2" class="step px-3 py-1 rounded-full">2 수집 범위</span></li>
-    <li>→</li><li><span data-step="3" class="step px-3 py-1 rounded-full">3 실행</span></li>
-    <li>→</li><li><span data-step="4" class="step px-3 py-1 rounded-full">4 완료</span></li>
-  </ol>
-
+  <!-- 알림 배너 — 모든 탭이 함께 쓴다 -->
   <div id="error" class="hidden mb-6 px-4 py-3 rounded-lg bg-red-50 border border-red-200 text-red-700 text-sm"></div>
 
+  <!-- 단계 표시 — 채널 흐름과 개별 영상 흐름이 라벨만 바꿔 쓴다 -->
+  <ol id="steps" class="hidden flex items-center gap-2 text-xs mb-8 text-slate-400"></ol>
+
+  <div id="collectMode">
   <!-- [1] 채널 입력 -->
   <section id="screen1" class="bg-white rounded-xl border border-slate-200 p-8">
     <label class="block text-sm font-medium mb-2">채널 URL 또는 채널명</label>
@@ -179,6 +177,25 @@
       <button class="back text-sm text-slate-500 hover:text-slate-800" data-to="1">← 다른 채널 고르기</button>
     </div>
   </section>
+  </div>
+
+  <!-- 개별 영상 — 링크를 붙여넣어 그 영상만 받는다 -->
+  <div id="videoMode" class="hidden">
+    <section id="screenV" class="bg-white rounded-xl border border-slate-200 p-8">
+      <label class="block text-sm font-medium mb-2">영상 링크</label>
+      <textarea id="vurls" rows="5"
+                placeholder="https://www.youtube.com/watch?v=...&#10;https://youtu.be/...&#10;여러 개는 줄을 바꿔 넣으세요"
+                class="w-full px-4 py-3 rounded-lg border border-slate-300 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-slate-400"></textarea>
+      <div class="flex items-center gap-3 mt-3 flex-wrap">
+        <button id="vcheckBtn" class="px-6 py-3 rounded-lg bg-slate-900 text-white font-medium hover:bg-slate-700 disabled:opacity-40">확인</button>
+        <span class="text-xs text-slate-500">자막은 그 영상이 속한 채널 폴더에 저장됩니다. 이미 받은 영상은 건너뜁니다.</span>
+      </div>
+      <div id="vresult" class="hidden mt-6 pt-6 border-t border-slate-200"></div>
+    </section>
+  </div>
+
+  <!-- 실행·완료 — 채널 흐름과 개별 영상 흐름이 함께 쓴다 -->
+  <div id="runMode" class="hidden">
 
   <!-- [3] 실행 중 -->
   <section id="screen3" class="hidden">
@@ -259,6 +276,17 @@
     <button class="back mt-6 text-sm text-slate-500 hover:text-slate-800" data-to="1">← 새 채널 수집</button>
   </section>
   </div>
+
+  <!-- 대기열 — 채널 수집과 개별 영상 수집을 한 목록으로 본다 -->
+  <section id="queueMode" class="hidden">
+    <div class="bg-white rounded-xl border border-slate-200 p-6">
+      <div class="flex items-baseline justify-between mb-4">
+        <h3 class="font-semibold">대기열</h3>
+        <span class="text-xs text-slate-400">행을 누르면 그 작업 화면으로 갑니다</span>
+      </div>
+      <div id="queueList" class="space-y-2"></div>
+    </div>
+  </section>
 
   <!-- 자막 검색 -->
   <section id="findMode" class="hidden">

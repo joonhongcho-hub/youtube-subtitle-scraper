@@ -308,6 +308,113 @@ def fetch_playlists(channel_base_url):
     return playlists
 
 
+# 영상 하나를 해석할 때 뽑는 항목. 저장에 쓰는 키(제목·업로드일)가 반드시 있어야
+# 하므로 _to_video()와 같은 모양으로 맞춘다.
+VIDEO_PRINT_FIELDS = ("original_url", "id", "title", "upload_date",
+                      "channel", "channel_url", "duration", "view_count")
+# 제목에 |가 들어갈 수 있어 구분자는 흔치 않은 문자로 둔다
+PRINT_SEPARATOR = "\x1f"
+
+
+def _print_template():
+    return PRINT_SEPARATOR.join("%({})s".format(f) for f in VIDEO_PRINT_FIELDS)
+
+
+def _as_number(text):
+    """yt-dlp가 값이 없을 때 주는 'NA'를 None으로 바꾼다."""
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
+# 링크 해석은 사람이 화면 앞에서 기다리는 작업이다. 유튜브가 응답하지 않을 때
+# 기본 재시도를 다 돌면 링크 하나에 몇 분씩 걸리므로 짧게 끊는다.
+RESOLVE_SOCKET_TIMEOUT = 15
+RESOLVE_RETRIES = 1
+
+
+def resolve_videos(urls, timeout=None):
+    """영상 링크 여러 개를 한 번의 yt-dlp 호출로 해석한다.
+
+    링크마다 따로 부르면 하나에 몇 초씩 걸려 10개만 돼도 한참이다. yt-dlp는
+    URL을 여러 개 받으면 한 번에 처리하므로 프로세스 하나로 끝낸다.
+
+    --no-playlist 는 watch?v=..&list=.. 형태에서 그 영상 하나만 집게 한다.
+    --ignore-errors 로 죽은 링크가 있어도 나머지는 계속 간다. 실패한 링크는
+    stdout에 줄이 안 나오므로, %(original_url)s로 짝지어 빠진 것을 찾아낸다.
+
+    Returns:
+        (videos, failed) — videos는 _to_video()와 같은 모양에 channel_name·
+        channel_url이 붙은 레코드, failed는 해석하지 못한 입력 URL 목록
+    """
+    urls = list(urls)
+    if not urls:
+        return [], []
+    # 링크가 많으면 그만큼은 기다려 주되, 전체 상한을 둔다
+    timeout = timeout or min(600, 30 + 25 * len(urls))
+
+    try:
+        stdout, stderr, code = _run_ytdlp(
+            ["--skip-download", "--no-playlist", "--ignore-errors",
+             "--socket-timeout", str(RESOLVE_SOCKET_TIMEOUT),
+             "--retries", str(RESOLVE_RETRIES),
+             "--extractor-retries", str(RESOLVE_RETRIES),
+             "--print", _print_template()] + urls,
+            timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            "영상 정보를 가져오지 못했습니다 — 유튜브 응답이 너무 느립니다. "
+            "잠시 뒤 다시 시도해 주세요.")
+
+    videos = []
+    seen_inputs = set()
+    for line in stdout.splitlines():
+        parts = line.rstrip("\n").split(PRINT_SEPARATOR)
+        if len(parts) != len(VIDEO_PRINT_FIELDS):
+            continue
+        (original, video_id, title, upload_date,
+         channel_name, channel_url, duration, view_count) = parts
+        if not video_id or video_id == "NA":
+            continue
+        seen_inputs.add(original)
+        videos.append({
+            "video_id": video_id,
+            "title": title or video_id,
+            # 업로드일이 없으면 목록 쪽과 같은 표시(00000000)를 쓴다
+            "upload_date": upload_date if upload_date.isdigit() else "00000000",
+            "duration": _as_number(duration),
+            "view_count": _as_number(view_count),
+            "order": len(videos),
+            "url": "https://www.youtube.com/watch?v={}".format(video_id),
+            "channel_name": channel_name if channel_name != "NA" else "",
+            "channel_url": channel_url if channel_url != "NA" else "",
+        })
+
+    failed = [u for u in urls if u not in seen_inputs]
+    # 하나도 못 건졌으면 왜인지 알려준다 — 링크가 아니라 네트워크 문제일 수 있다
+    if not videos and code != 0:
+        raise RuntimeError("영상 정보를 가져오지 못했습니다 — {}".format(
+            _ytdlp_reason(stderr)))
+    return videos, failed
+
+
+def _ytdlp_reason(stderr):
+    """yt-dlp가 쏟아낸 출력에서 사람이 읽을 한 줄을 고른다.
+
+    재시도 경고가 수십 줄씩 쌓여 그대로 보여주면 무슨 일인지 알 수 없다.
+    ERROR 줄이 있으면 그것을, 없으면 마지막 줄을 쓴다.
+    """
+    lines = [l.strip() for l in (stderr or "").splitlines() if l.strip()]
+    if not lines:
+        return "알 수 없는 오류"
+    errors = [l for l in lines if l.startswith("ERROR:")]
+    line = errors[-1] if errors else lines[-1]
+    if "timed out" in line.lower() or "timeout" in line.lower():
+        return "유튜브 응답이 없습니다. 잠시 뒤 다시 시도해 주세요."
+    return line[:200]
+
+
 def fetch_video_list(channel_url, out_dir):
     """CLI 진입점 — 채널의 일반 영상 목록을 videos.json으로 관리한다."""
     path = os.path.join(out_dir, "videos.json")

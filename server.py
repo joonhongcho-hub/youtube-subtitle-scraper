@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import io
 import os
+import re
 import shlex
 import subprocess
 import threading
@@ -176,11 +177,23 @@ def find_channel_dir(folder_name):
     return None
 
 
+def new_channel_dir(folder):
+    """처음 보는 채널이 들어갈 자리.
+
+    저장 위치를 자막/<카테고리> 같은 안쪽 폴더로 지정할 수 있으므로, 거기에
+    또 자막/미분류를 붙이면 자막/AI, 코딩, 개발/자막/미분류/채널 처럼 겹친다.
+    이미 자막 폴더 안을 가리키고 있으면 그 폴더에 채널을 바로 넣는다.
+    """
+    root = output_root()
+    if TRANSCRIPT_DIR in os.path.normpath(root).split(os.sep):
+        return os.path.join(root, folder)
+    return os.path.join(root, TRANSCRIPT_DIR, UNSORTED_DIR, folder)
+
+
 def channel_dir(channel_name):
     """채널별 결과 폴더. 재실행하면 이미 받은 자막을 건너뛰어 이어받는다."""
     folder = storage.sanitize_filename(channel_name)
-    return find_channel_dir(folder) or os.path.join(
-        output_root(), TRANSCRIPT_DIR, UNSORTED_DIR, folder)
+    return find_channel_dir(folder) or new_channel_dir(folder)
 
 
 def apply_filters(videos, filters, source):
@@ -523,21 +536,49 @@ def start_queue_supervisor():
     threading.Thread(target=queue_supervisor, daemon=True).start()
 
 
+# 대기열 화면에 함께 보여줄 최근 끝난 작업 수
+RECENT_JOBS = 5
+
+
 @app.get("/api/queue")
 def api_queue():
-    """실행 중인 작업과 뒤에 선 작업들."""
+    """대기열 화면이 쓰는 한 벌 — 실행 중 · 대기 중 · 최근 끝남.
+
+    채널 작업과 개별 영상 작업을 구분하지 않고 같은 모양으로 돌려준다.
+    화면은 kind로 배지만 다르게 그리면 된다.
+    """
     active = jobs.registry.active()
+
+    finished = [j for j in jobs.registry.jobs.values()
+                if j.finished_at and j is not active]
+    finished.sort(key=lambda j: j.finished_at, reverse=True)
+
     return {
         "running": active.state() if active else None,
         "pending": [
             {
                 "job_id": job.id,
+                "kind": job.kind,
+                "label": job.label,
                 "channel_name": job.channel_name,
                 "total": job.total,
                 "seconds": engine.estimate_seconds(job.total),
                 "position": i + 1,
             }
             for i, job in enumerate(jobs.registry.pending())
+        ],
+        "recent": [
+            {
+                "job_id": job.id,
+                "kind": job.kind,
+                "label": job.label,
+                "channel_name": job.channel_name,
+                "status": job.status,
+                "done": job.done,
+                "total": job.total,
+                "finished_at": job.finished_at,
+            }
+            for job in finished[:RECENT_JOBS]
         ],
     }
 
@@ -567,21 +608,155 @@ def api_create_job(req: JobRequest):
         raise HTTPException(400, "조건에 맞는 영상이 없습니다.")
 
     job = jobs.Job(name, base, out_dir, targets, req.options.dict())
+    return enqueue_or_start(job)
 
-    # 이미 도는 작업이 있으면 막지 않고 줄을 세운다.
-    # 대상 목록은 지금 확정해 둔다 — 대기 중에도 개수를 보여줄 수 있고,
-    # 차례가 왔을 때 채널 목록을 다시 받느라 멈춰 서지 않는다.
+
+def enqueue_or_start(job):
+    """비어 있으면 바로 시작하고, 도는 작업이 있으면 줄을 세운다.
+
+    대상 목록은 만들 때 이미 확정해 둔다 — 대기 중에도 개수를 보여줄 수 있고,
+    차례가 왔을 때 채널 목록을 다시 받느라 멈춰 서지 않는다.
+    """
     if jobs.registry.active():
         job.status = jobs.STATUS_QUEUED
         job.queued_at = time.time()
         jobs.registry.add(job)
         job.log("info", "대기열에 넣었습니다 — 앞 작업이 끝나면 자동으로 시작합니다.")
         return {"job_id": job.id, "total": job.total, "queued": True,
-                "position": len(jobs.registry.pending())}
+                "position": len(jobs.registry.pending()), "label": job.label}
 
     jobs.registry.add(job)
     start_thread(job, job.targets)
-    return {"job_id": job.id, "total": job.total, "queued": False, "position": 0}
+    return {"job_id": job.id, "total": job.total, "queued": False,
+            "position": 0, "label": job.label}
+
+
+# --- 개별 영상 API ---
+
+# 한 번에 받을 링크 수 상한. 재생목록 링크가 섞이면 수백 개로 불어날 수 있다.
+MAX_VIDEO_URLS = 50
+# 유튜브 영상 ID는 11자리다 — 링크 대신 ID만 붙여넣는 경우도 받아준다
+VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+
+class VideoUrlsRequest(BaseModel):
+    text: str = ""
+    options: Options = Options()
+
+
+def parse_video_urls(text):
+    """붙여넣은 텍스트에서 영상 링크를 뽑는다.
+
+    줄바꿈·공백·쉼표 아무렇게나 섞여 들어와도 되게 한다. 실제로 유튜브 링크인지는
+    yt-dlp가 판단하므로 여기서는 명백히 링크가 아닌 것만 걸러낸다.
+    """
+    urls = []
+    for token in re.split(r"[\s,]+", text or ""):
+        token = token.strip()
+        if not token:
+            continue
+        if VIDEO_ID_PATTERN.match(token):
+            token = "https://www.youtube.com/watch?v={}".format(token)
+        elif not channel._is_url(token):
+            continue
+        if token not in urls:      # 같은 링크를 두 번 받지 않는다
+            urls.append(token)
+    return urls
+
+
+def group_by_channel(videos):
+    """해석한 영상을 채널별로 묶는다.
+
+    작업 하나는 저장 폴더 하나를 쓰므로 여러 채널을 한 작업에 담을 수 없다.
+    채널로 나눠야 저장 위치·이어받기·검색이 채널 작업과 똑같이 맞아떨어진다.
+    """
+    groups = {}
+    for video in videos:
+        name = video.get("channel_name") or "channel"
+        group = groups.setdefault(name, {
+            "channel_name": name,
+            "channel_url": video.get("channel_url") or "",
+            "videos": [],
+        })
+        group["videos"].append(video)
+    return list(groups.values())
+
+
+@app.post("/api/videos/resolve")
+def api_videos_resolve(req: VideoUrlsRequest):
+    """붙여넣은 링크가 어떤 영상인지 확인해 돌려준다 (아직 받지는 않는다)."""
+    urls = parse_video_urls(req.text)
+    if not urls:
+        raise HTTPException(400, "영상 링크를 찾지 못했습니다.")
+    if len(urls) > MAX_VIDEO_URLS:
+        raise HTTPException(400, "한 번에 {}개까지만 넣을 수 있습니다 (지금 {}개).".format(
+            MAX_VIDEO_URLS, len(urls)))
+
+    try:
+        videos, failed = channel.resolve_videos(urls)
+    except (RuntimeError, subprocess.TimeoutExpired) as exc:
+        # channel 쪽에서 이미 사람이 읽을 문장을 만들어 준다
+        raise HTTPException(400, str(exc)[:300])
+
+    groups = []
+    for group in group_by_channel(videos):
+        out_dir = channel_dir(group["channel_name"])
+        store = engine.Store(out_dir) if os.path.isdir(out_dir) else None
+        items = [{
+            "video_id": v["video_id"],
+            "title": v["title"],
+            "upload_date": v["upload_date"],
+            "url": v["url"],
+            # 이미 받은 영상은 수집이 건너뛴다 — 미리 알려준다
+            "already": bool(store and store.is_done(v["video_id"])),
+        } for v in group["videos"]]
+        groups.append({
+            "channel_name": group["channel_name"],
+            "channel_url": group["channel_url"],
+            "out_dir": out_dir,
+            "videos": items,
+            "already": sum(1 for i in items if i["already"]),
+        })
+
+    total = len(videos)
+    remaining = total - sum(g["already"] for g in groups)
+    return {
+        "groups": groups,
+        "failed": failed,
+        "total": total,
+        "remaining": remaining,
+        "seconds": engine.estimate_seconds(remaining),
+    }
+
+
+@app.post("/api/videos/jobs")
+def api_videos_jobs(req: VideoUrlsRequest):
+    """개별 영상 수집을 시작한다. 채널별로 작업을 만들어 줄을 세운다."""
+    urls = parse_video_urls(req.text)
+    if not urls:
+        raise HTTPException(400, "영상 링크를 찾지 못했습니다.")
+    if len(urls) > MAX_VIDEO_URLS:
+        raise HTTPException(400, "한 번에 {}개까지만 넣을 수 있습니다 (지금 {}개).".format(
+            MAX_VIDEO_URLS, len(urls)))
+
+    try:
+        videos, failed = channel.resolve_videos(urls)
+    except (RuntimeError, subprocess.TimeoutExpired) as exc:
+        # channel 쪽에서 이미 사람이 읽을 문장을 만들어 준다
+        raise HTTPException(400, str(exc)[:300])
+    if not videos:
+        raise HTTPException(400, "해석할 수 있는 영상이 없습니다.")
+
+    created = []
+    for group in group_by_channel(videos):
+        name = group["channel_name"]
+        out_dir = channel_dir(name)
+        os.makedirs(out_dir, exist_ok=True)
+        job = jobs.Job(name, group["channel_url"], out_dir, group["videos"],
+                       req.options.dict(), kind=jobs.KIND_VIDEOS)
+        created.append(enqueue_or_start(job))
+
+    return {"jobs": created, "failed": failed}
 
 
 @app.get("/api/jobs/latest")

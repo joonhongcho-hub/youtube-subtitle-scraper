@@ -82,14 +82,19 @@ class Store(object):
     """[안전장치 C] 영상 1개를 처리할 때마다 즉시 디스크에 반영한다.
 
     중간에 끊겨도 다음 실행에서 이어서 할 수 있도록,
-    처리 기록과 실패 목록, index.xlsx를 매번 새로 써낸다.
+    처리 기록과 실패 목록을 매번 새로 써낸다.
+
+    기록은 채널 폴더가 아니라 앱 안쪽(storage.state_dir)에 둔다 — 사용자가 고른
+    저장 폴더에는 자막 .txt만 남아야 한다.
     """
 
     def __init__(self, out_dir):
         self.out_dir = out_dir
-        self.processed_path = os.path.join(out_dir, "processed_ids.json")
-        self.failed_path = os.path.join(out_dir, "failed_videos.json")
-        self.index_path = os.path.join(out_dir, "index.xlsx")
+        # 예전 방식으로 채널 폴더에 들어간 기록이 있으면 이때 옮겨온다
+        storage.migrate_state(out_dir)
+        self.state_dir = storage.state_dir(out_dir)
+        self.processed_path = os.path.join(self.state_dir, "processed_ids.json")
+        self.failed_path = os.path.join(self.state_dir, "failed_videos.json")
         self.records = storage.load_json(self.processed_path, {})
 
     def get(self, video_id):
@@ -124,7 +129,6 @@ class Store(object):
             "detail": r.get("detail", ""),
         } for vid, r in self.records.items() if r["status"] != subtitle.SUCCESS}
         storage.save_json(self.failed_path, failed)
-        storage.write_index(self.all_records(), self.index_path)
 
 
 def process_videos(videos, channel_name, store, langs, mode, api,

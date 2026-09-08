@@ -5,7 +5,10 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 
+import storage
 from subtitle import BROWSER_UA
 
 YOUTUBE_HOSTS = ("youtube.com", "youtu.be")
@@ -14,13 +17,70 @@ SEARCH_COUNT = 20
 APPROX_DATE_ARGS = ["--extractor-args", "youtubetab:approximate_date"]
 
 
+def _ytdlp_command(args):
+    # venv 밖의 yt-dlp를 잘못 집지 않도록 현재 인터프리터의 모듈로 실행한다
+    return [sys.executable, "-m", "yt_dlp",
+            "--user-agent", BROWSER_UA, "--ignore-config"] + args
+
+
 def _run_ytdlp(args, timeout=600):
     """venv 안의 yt-dlp를 실행하고 (stdout, stderr, returncode)를 돌려준다."""
-    # venv 밖의 yt-dlp를 잘못 집지 않도록 현재 인터프리터의 모듈로 실행한다
-    cmd = [sys.executable, "-m", "yt_dlp",
-           "--user-agent", BROWSER_UA, "--ignore-config"] + args
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    proc = subprocess.run(_ytdlp_command(args), capture_output=True,
+                          text=True, timeout=timeout)
     return proc.stdout, proc.stderr, proc.returncode
+
+
+# 감시 스레드가 프로세스 상태를 들여다보는 간격
+WATCHDOG_POLL_SECONDS = 0.2
+
+
+def _stream_ytdlp(args, timeout, on_line, cancel=None):
+    """yt-dlp를 띄우고 stdout을 한 줄씩 on_line에 넘긴다.
+
+    _run_ytdlp와 달리 끝나기를 기다리지 않으므로 진행 상황을 그때그때 알릴 수
+    있다. 대신 두 가지를 직접 챙겨야 한다.
+
+    - stderr는 별도 스레드로 계속 비운다. 재시도 경고가 파이프 버퍼를 채우면
+      yt-dlp가 쓰지 못해 그대로 멈춰 선다.
+    - 시간 초과·취소는 감시 스레드가 프로세스를 죽여서 알린다. stdout 읽기는
+      막혀 있을 수 있어 읽는 쪽에서 시계를 볼 수 없다.
+
+    Returns:
+        (stderr_text, returncode, stopped) — stopped는 왜 끝났는지를 담은
+        {"timeout": bool, "cancelled": bool}
+    """
+    # 파이프로 넘길 때 파이썬이 출력을 뭉쳐 두면 진행 상황이 끝에 몰려 나온다
+    env = dict(os.environ, PYTHONUNBUFFERED="1")
+    proc = subprocess.Popen(_ytdlp_command(args), stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, bufsize=1,
+                            env=env)
+    errors = []
+    stopped = {"timeout": False, "cancelled": False}
+
+    def drain_stderr():
+        for line in proc.stderr:
+            errors.append(line)
+
+    def watchdog():
+        deadline = time.time() + timeout
+        while proc.poll() is None:
+            if cancel is not None and cancel.is_set():
+                stopped["cancelled"] = True
+                proc.kill()
+                return
+            if time.time() >= deadline:
+                stopped["timeout"] = True
+                proc.kill()
+                return
+            time.sleep(WATCHDOG_POLL_SECONDS)
+
+    threading.Thread(target=drain_stderr, daemon=True).start()
+    threading.Thread(target=watchdog, daemon=True).start()
+
+    for line in proc.stdout:
+        on_line(line)
+    proc.wait()
+    return "".join(errors), proc.returncode, stopped
 
 
 def _is_url(value):
@@ -257,16 +317,21 @@ def channel_base(url):
 
 
 def fetch_source(channel_base_url, source, out_dir, force=False, log=None):
-    """채널의 특정 탭(videos/shorts/streams) 목록을 가져온다."""
+    """채널의 특정 탭(videos/shorts/streams) 목록을 가져온다.
+
+    목록 캐시는 채널 폴더가 아니라 앱 안쪽에 둔다 — 사용자가 고른 저장 폴더에는
+    자막 .txt만 남아야 한다.
+    """
     tab_url = "{}/{}".format(channel_base_url.rstrip("/"), source)
-    cache = os.path.join(out_dir, SOURCE_TABS[source])
+    cache = os.path.join(storage.state_dir(out_dir), SOURCE_TABS[source])
     return fetch_entries(tab_url, cache, force=force, log=log)
 
 
 def fetch_playlist(playlist_id, out_dir, force=False, log=None):
     """재생목록 하나의 영상 목록을 가져온다."""
     url = "https://www.youtube.com/playlist?list={}".format(playlist_id)
-    cache = os.path.join(out_dir, "playlist_{}.json".format(playlist_id))
+    cache = os.path.join(storage.state_dir(out_dir),
+                         "playlist_{}.json".format(playlist_id))
     return fetch_entries(url, cache, force=force, log=log)
 
 
@@ -334,7 +399,7 @@ RESOLVE_SOCKET_TIMEOUT = 15
 RESOLVE_RETRIES = 1
 
 
-def resolve_videos(urls, timeout=None):
+def resolve_videos(urls, timeout=None, on_progress=None, cancel=None):
     """영상 링크 여러 개를 한 번의 yt-dlp 호출로 해석한다.
 
     링크마다 따로 부르면 하나에 몇 초씩 걸려 10개만 돼도 한참이다. yt-dlp는
@@ -343,6 +408,11 @@ def resolve_videos(urls, timeout=None):
     --no-playlist 는 watch?v=..&list=.. 형태에서 그 영상 하나만 집게 한다.
     --ignore-errors 로 죽은 링크가 있어도 나머지는 계속 간다. 실패한 링크는
     stdout에 줄이 안 나오므로, %(original_url)s로 짝지어 빠진 것을 찾아낸다.
+
+    사람이 화면 앞에서 기다리는 작업이라 결과를 한꺼번에 받지 않고 흘려 읽는다.
+    on_progress(done, total)로 몇 개까지 됐는지 알리고, 시간이 다 되거나
+    cancel이 서면 그때까지 건진 것을 그대로 돌려준다 — 전부 버리고 다시
+    시작하게 만들면 기다린 시간이 통째로 사라진다.
 
     Returns:
         (videos, failed) — videos는 _to_video()와 같은 모양에 channel_name·
@@ -354,29 +424,17 @@ def resolve_videos(urls, timeout=None):
     # 링크가 많으면 그만큼은 기다려 주되, 전체 상한을 둔다
     timeout = timeout or min(600, 30 + 25 * len(urls))
 
-    try:
-        stdout, stderr, code = _run_ytdlp(
-            ["--skip-download", "--no-playlist", "--ignore-errors",
-             "--socket-timeout", str(RESOLVE_SOCKET_TIMEOUT),
-             "--retries", str(RESOLVE_RETRIES),
-             "--extractor-retries", str(RESOLVE_RETRIES),
-             "--print", _print_template()] + urls,
-            timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(
-            "영상 정보를 가져오지 못했습니다 — 유튜브 응답이 너무 느립니다. "
-            "잠시 뒤 다시 시도해 주세요.")
-
     videos = []
     seen_inputs = set()
-    for line in stdout.splitlines():
+
+    def take(line):
         parts = line.rstrip("\n").split(PRINT_SEPARATOR)
         if len(parts) != len(VIDEO_PRINT_FIELDS):
-            continue
+            return
         (original, video_id, title, upload_date,
          channel_name, channel_url, duration, view_count) = parts
         if not video_id or video_id == "NA":
-            continue
+            return
         seen_inputs.add(original)
         videos.append({
             "video_id": video_id,
@@ -390,14 +448,29 @@ def resolve_videos(urls, timeout=None):
             "channel_name": channel_name if channel_name != "NA" else "",
             "channel_url": channel_url if channel_url != "NA" else "",
         })
+        if on_progress:
+            on_progress(len(videos), len(urls))
+
+    stderr, code, stopped = _stream_ytdlp(
+        ["--skip-download", "--no-playlist", "--ignore-errors",
+         "--socket-timeout", str(RESOLVE_SOCKET_TIMEOUT),
+         "--retries", str(RESOLVE_RETRIES),
+         "--extractor-retries", str(RESOLVE_RETRIES),
+         "--print", _print_template()] + urls,
+        timeout, take, cancel=cancel)
 
     failed = [u for u in urls if u not in seen_inputs]
-    # 하나도 못 건졌으면 왜인지 알려준다 — 링크가 아니라 네트워크 문제일 수 있다
-    if not videos and code != 0:
-        raise RuntimeError("영상 정보를 가져오지 못했습니다 — {}".format(
-            _ytdlp_reason(stderr)))
+    # 하나라도 건졌으면 그것을 돌려준다. 나머지는 failed에 담겨 화면에 그대로
+    # 나열되므로, 어떤 링크가 빠졌는지 사용자가 보고 다시 걸 수 있다.
+    if not videos and not stopped["cancelled"]:
+        if stopped["timeout"]:
+            raise RuntimeError(
+                "영상 정보를 가져오지 못했습니다 — 유튜브 응답이 너무 느립니다. "
+                "잠시 뒤 다시 시도해 주세요.")
+        if code != 0:
+            raise RuntimeError("영상 정보를 가져오지 못했습니다 — {}".format(
+                _ytdlp_reason(stderr)))
     return videos, failed
-
 
 def _ytdlp_reason(stderr):
     """yt-dlp가 쏟아낸 출력에서 사람이 읽을 한 줄을 고른다.
@@ -417,7 +490,7 @@ def _ytdlp_reason(stderr):
 
 def fetch_video_list(channel_url, out_dir):
     """CLI 진입점 — 채널의 일반 영상 목록을 videos.json으로 관리한다."""
-    path = os.path.join(out_dir, "videos.json")
+    path = os.path.join(storage.state_dir(out_dir), "videos.json")
     reused = os.path.exists(path)
     result = fetch_entries(channel_url, path,
                            log=lambda level, message: print(message))

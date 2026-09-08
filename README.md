@@ -101,20 +101,32 @@ python main.py "https://www.youtube.com/playlist?list=UUQNE2JmbasNYbjGAcuBiRRg"
 
 ## 출력 구조
 
+**지정한 저장 위치에는 채널 폴더와 자막만 둡니다.**
+
 ```
-output/
-  videos.json          채널 영상 목록 (있으면 무조건 재사용)
-  processed_ids.json   처리 완료 기록
-  failed_videos.json   실패 기록 + 사유
-  index.xlsx           영상 제목 | 업로드일 | 파일경로 | 원본 URL | 상태
+{저장 위치}/
   {채널명}/{업로드일}_{영상제목}.txt
 ```
+
+처리 기록·목록 캐시 같은 앱 사정은 저장 위치가 아니라 앱 폴더에 모읍니다.
+자막 폴더를 열었을 때 자막만 보여야 하기 때문입니다.
+
+```
+output/_state/{채널명}/
+  videos.json          채널 영상 목록 (있으면 무조건 재사용)
+  processed_ids.json   처리 완료 기록 — 이어받기와 검색 메타의 근거
+  failed_videos.json   실패 기록 + 사유
+```
+
+`index.xlsx`는 수집 중에 만들지 않고 다운로드할 때 그 자리에서 만듭니다.
+예전 방식으로 채널 폴더에 남아 있는 파일은 서버가 뜰 때 자동으로 옮깁니다.
 
 ## 동작 방식
 
 1. **채널 식별** — URL이면 그대로, 채널명이면 검색 후 번호 선택 (동명 채널 구분)
 2. **영상 목록 수집** — `yt-dlp --flat-playlist`. `videos.json`이 있으면 재사용하므로,
-   새 영상을 반영하려면 이 파일을 직접 삭제해야 합니다.
+   새 영상을 반영하려면 `output/_state/{채널명}/videos.json`을 지우거나
+   화면에서 "목록 새로고침"을 누릅니다.
 3. **자막 수집** — `youtube-transcript-api`가 기본 경로, 실패하면 `yt-dlp`로 폴백.
    수동 자막 → 자동생성 자막 순으로 찾고, 언어는 `--lang` 순서를 따릅니다.
 4. **정제** — 타임스탬프·인라인 태그·메타데이터 제거, 자동자막 중복줄 병합, 문단 재구성

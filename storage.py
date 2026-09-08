@@ -3,9 +3,12 @@
 import json
 import os
 import re
+import shutil
 import unicodedata
 
 import pandas as pd
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 윈도우/맥에서 파일명에 쓸 수 없는 문자
 FORBIDDEN = r'/\:*?"<>|'
@@ -37,6 +40,65 @@ def sanitize_filename(name, max_len=MAX_FILENAME_LEN):
     # 끝의 점·공백은 OS가 싫어한다
     cleaned = cleaned.rstrip(" ._")
     return cleaned or "untitled"
+
+
+# --- 부기 파일 자리 -------------------------------------------------------
+
+# 사용자가 고른 저장 폴더에는 채널 폴더와 자막 .txt만 둔다. 처리 기록·목록 캐시
+# 같은 앱 사정은 여기 모은다 — 저장 폴더를 열었을 때 자막만 보여야 한다.
+STATE_ROOT = os.path.join(BASE_DIR, "output", "_state")
+
+# 예전에는 채널 폴더 안에 함께 두던 것들. index.xlsx는 이제 아예 만들지 않고
+# 다운로드할 때 그 자리에서 만든다.
+STATE_FILES = ("processed_ids.json", "failed_videos.json",
+               "videos.json", "shorts.json", "streams.json", "index.xlsx")
+
+
+def state_dir(out_dir):
+    """채널 폴더의 부기 파일이 들어갈 자리.
+
+    경로가 아니라 폴더 이름으로 자리를 잡는다 — 채널을 카테고리 폴더 사이로
+    옮겨도 기록이 따라와야 이미 받은 수백 개를 처음부터 다시 받지 않는다.
+    채널 폴더를 이름으로 찾는 server.channel_dir()과 같은 기준이다.
+    """
+    folder = sanitize_filename(os.path.basename(os.path.normpath(out_dir)))
+    return os.path.join(STATE_ROOT, folder)
+
+
+def _is_state_file(name):
+    return name in STATE_FILES or (name.startswith("playlist_")
+                                   and name.endswith(".json"))
+
+
+def migrate_state(out_dir):
+    """채널 폴더에 남아 있는 옛 부기 파일을 state 폴더로 옮긴다.
+
+    지우지 않고 옮긴다 — 이어받기 기록이라 잃으면 수백 개를 다시 받는다.
+    양쪽에 다 있으면 최근에 손댄 쪽을 남긴다.
+    """
+    if not os.path.isdir(out_dir):
+        return
+    try:
+        names = [n for n in os.listdir(out_dir) if _is_state_file(n)]
+    except OSError:
+        return
+    if not names:
+        return
+
+    target = state_dir(out_dir)
+    os.makedirs(target, exist_ok=True)
+    for name in names:
+        source = os.path.join(out_dir, name)
+        dest = os.path.join(target, name)
+        try:
+            if os.path.exists(dest) and (os.path.getmtime(dest)
+                                         >= os.path.getmtime(source)):
+                os.remove(source)     # state 쪽이 더 새것 — 남은 자국만 치운다
+            else:
+                # 저장 폴더가 다른 볼륨일 수 있어 rename 대신 move를 쓴다
+                shutil.move(source, dest)
+        except OSError:
+            continue
 
 
 def unique_path(dir_path, stem, ext=".txt"):

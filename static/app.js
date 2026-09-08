@@ -684,6 +684,10 @@ async function startJob() {
 
 // --- 대기열 ---
 
+// 지금 도는 작업이 있는지. 개별 영상 화면이 "확인이 느릴 수 있다"고 알리고
+// 시작 버튼 글자를 "대기열에 넣기"로 바꾸는 데 쓴다.
+let queueBusy = false;
+
 // 상단 요약 — 돌고 있거나 줄 서 있는 게 있으면 어느 탭에서든 한 줄로 알린다.
 // 예전에는 대기 중인 게 있을 때만 떠서, 채널 하나만 돌 때는 아무 표시가 없었다.
 async function loadQueue() {
@@ -691,6 +695,7 @@ async function loadQueue() {
   try {
     const data = await api('/api/queue');
     const r = data.running;
+    queueBusy = Boolean(r);
     if (!r && !data.pending.length) { bar.classList.add('hidden'); return; }
 
     const pct = r && r.total ? Math.round((r.done / r.total) * 100) : 0;
@@ -715,30 +720,116 @@ async function loadQueue() {
 
 // --- 개별 영상 ---
 
-let resolved = null;   // 확인한 결과 — 시작 버튼이 이걸 보고 열린다
+let resolved = null;      // 확인이 끝난 결과 — 수집 시작이 이걸 그대로 쓴다
+let resolveId = null;     // 확인 중인 해석 id (진행 조회·취소에 쓴다)
+let resolveTimer = null;
+
+// 확인은 링크 하나에 2초 남짓, 채널 수집이 도는 중이면 더 걸린다. 그동안 아무
+// 표시가 없으면 멈춘 것과 구분되지 않으므로 진행 상황을 계속 물어본다.
+const RESOLVE_POLL_MS = 1000;
 
 $('vcheckBtn').addEventListener('click', resolveVideos);
+
+// 링크를 고치면 확인해 둔 결과는 더 이상 그 링크의 것이 아니다
+$('vurls').addEventListener('input', () => {
+  if (!resolved) return;
+  resolved = null;
+  $('vresult').classList.add('hidden');
+});
+
+// 링크를 줄바꿈으로 넣으므로 맨 Enter는 줄바꿈 그대로 두고 ⌘/Ctrl+Enter로 확인한다
+$('vurls').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+    e.preventDefault();
+    resolveVideos();
+  }
+});
 
 async function resolveVideos() {
   const text = $('vurls').value.trim();
   if (!text) { showError('영상 링크를 넣어주세요.'); return; }
+  if (resolveId) return;          // 이미 확인 중
+  clearError();
+  resolved = null;
   const btn = $('vcheckBtn');
   btn.disabled = true; btn.textContent = '확인 중…';
   try {
-    const data = await api('/api/videos/resolve', {
+    const start = await api('/api/videos/resolve', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text }),
     });
-    resolved = data;
-    renderResolved(data);
+    resolveId = start.resolve_id;
+    renderResolveProgress({ done: 0, total: start.total, elapsed: 0 });
+    pollResolve();
   } catch (err) {
+    endResolve();
     showError(err.message);
-  } finally {
-    btn.disabled = false; btn.textContent = '확인';
   }
 }
 
+function renderResolveProgress(s) {
+  const pct = s.total ? Math.round((s.done / s.total) * 100) : 0;
+  // 확인이 느린 이유가 유튜브 쪽 대기라는 것을 알려준다
+  const busy = queueBusy
+    ? `<div class="text-xs text-amber-700 mt-2">채널 수집이 도는 중이라 확인이 느릴 수 있습니다.</div>`
+    : '';
+  const box = $('vresult');
+  box.innerHTML = `
+    <div class="flex items-center gap-3 flex-wrap">
+      <span class="text-sm">링크 ${formatCount(s.total)}개 확인 중
+        <b class="tabular-nums">${formatCount(s.done)}/${formatCount(s.total)}</b></span>
+      <span class="text-xs text-slate-400 tabular-nums">경과 ${formatClock(s.elapsed || 0)}</span>
+      <span class="flex-1"></span>
+      <button id="vcancelBtn" class="text-xs underline text-slate-500 hover:text-red-600">취소</button>
+    </div>
+    <div class="h-1.5 bg-slate-200 rounded-full overflow-hidden mt-3">
+      <div class="h-full bg-slate-900 transition-all duration-300" style="width:${pct}%"></div>
+    </div>${busy}`;
+  box.classList.remove('hidden');
+  $('vcancelBtn').addEventListener('click', cancelResolve);
+}
+
+function pollResolve() {
+  clearTimeout(resolveTimer);
+  resolveTimer = setTimeout(async () => {
+    if (!resolveId) return;
+    try {
+      const s = await api(`/api/videos/resolve/${resolveId}`);
+      if (s.status === 'running') { renderResolveProgress(s); pollResolve(); return; }
+      endResolve();
+      if (s.status === 'error') {
+        $('vresult').classList.add('hidden');
+        showError(s.error || '링크를 확인하지 못했습니다.');
+        return;
+      }
+      // 취소했거나 시간이 다 됐어도 그때까지 해석한 것은 그대로 쓸 수 있다
+      resolved = s;
+      renderResolved(s);
+    } catch (err) {
+      endResolve();
+      $('vresult').classList.add('hidden');
+      showError(err.message);
+    }
+  }, RESOLVE_POLL_MS);
+}
+
+function endResolve() {
+  clearTimeout(resolveTimer);
+  resolveTimer = null;
+  resolveId = null;
+  const btn = $('vcheckBtn');
+  btn.disabled = false; btn.textContent = '확인';
+}
+
+async function cancelResolve() {
+  if (!resolveId) return;
+  try {
+    await api(`/api/videos/resolve/${resolveId}/cancel`, { method: 'POST' });
+  } catch (err) {
+    // 이미 끝났을 수 있다 — 다음 폴링이 결과를 가져온다
+  }
+}
 function renderResolved(data) {
   const box = $('vresult');
   const groups = data.groups.map((g) => `
@@ -768,7 +859,8 @@ function renderResolved(data) {
   box.innerHTML = data.groups.length ? `
     ${groups}${failed}
     <div class="flex items-center gap-4 mt-5 pt-4 border-t border-slate-200 flex-wrap">
-      <button id="vstartBtn" class="px-6 py-3 rounded-lg bg-slate-900 text-white font-medium hover:bg-slate-700 disabled:opacity-40">수집 시작</button>
+      <button id="vstartBtn" class="px-6 py-3 rounded-lg bg-slate-900 text-white font-medium hover:bg-slate-700 disabled:opacity-40">${
+        queueBusy ? '대기열에 넣기' : '수집 시작'}</button>
       <span class="text-sm text-slate-500">받을 영상 <b>${formatCount(data.remaining)}개</b>
         <span class="text-slate-400">· 예상 ${formatDuration(data.seconds)}</span></span>
     </div>` : `<p class="text-sm text-slate-500">받을 수 있는 영상이 없습니다.</p>${failed}`;
@@ -780,12 +872,17 @@ function renderResolved(data) {
 
 async function startVideoJobs() {
   const btn = $('vstartBtn');
+  const label = btn.textContent;
   btn.disabled = true; btn.textContent = '준비 중…';
   try {
     const data = await api('/api/videos/jobs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: $('vurls').value.trim() }),
+      // 확인해 둔 결과를 그대로 쓴다. 링크를 다시 보내면 서버가 처음부터 또
+      // 해석하느라 몇십 초가 들고, 그동안 작업이 없어 대기열에도 안 뜬다.
+      body: JSON.stringify(resolved && resolved.resolve_id
+        ? { resolve_id: resolved.resolve_id }
+        : { text: $('vurls').value.trim() }),
     });
     const started = data.jobs.find((j) => !j.queued);
     const queued = data.jobs.filter((j) => j.queued);
@@ -798,12 +895,16 @@ async function startVideoJobs() {
         showNotice(`${queued.length}개 채널은 대기열에 넣었습니다. 앞 작업이 끝나면 이어서 시작합니다.`);
       }
     } else {
+      // 전부 줄을 섰다 — 화면을 옮기지 않는다. 대신 확인해 둔 목록은 접는다.
+      // 그대로 두면 같은 링크를 한 번 더 넣기 쉽고, 버튼은 이미 눌린 상태다.
       showNotice(`대기열에 ${data.jobs.length}개를 넣었습니다. 앞 작업이 끝나면 자동으로 시작합니다.`);
+      resolved = null;
+      $('vresult').classList.add('hidden');
       loadQueue();
     }
   } catch (err) {
     showError(err.message);
-    btn.disabled = false; btn.textContent = '수집 시작';
+    btn.disabled = false; btn.textContent = label;
   }
 }
 
@@ -1200,6 +1301,8 @@ function resetForNewChannel() {
   $('minMin').value = '';
   $('maxMin').value = '';
   // 확인해둔 영상 목록은 이미 시작한 것이라 남겨두면 헷갈린다
+  if (resolveId) cancelResolve();
+  endResolve();
   resolved = null;
   $('vresult').classList.add('hidden');
 }

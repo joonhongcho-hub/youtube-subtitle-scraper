@@ -136,7 +136,10 @@ def main(argv=None):
 
     # 리포트 + 재시도
     run_retries(store, channel_name, langs, mode, api, args.timestamps)
-    print("\n인덱스: {}".format(store.index_path))
+    # 자막 폴더에는 .txt만 남긴다. 목록이 필요하면 여기서 한 번 만들어 준다.
+    index_path = storage.write_index(store.all_records(),
+                                     os.path.join(store.state_dir, "index.xlsx"))
+    print("\n자막: {}\n인덱스: {}".format(out_dir, index_path))
     return 0
 
 

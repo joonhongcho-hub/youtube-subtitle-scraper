@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 import urllib.parse
+import uuid
 import zipfile
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -28,10 +29,7 @@ import subtitle
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_ROOT = os.path.join(BASE_DIR, "output")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
-# 결과물은 한곳에 모으고, 그 아래를 카테고리로 나눈다.
-# _index·_jobs 같은 내부 파일과 사람이 보는 자막을 섞어두면 정리할 수가 없다.
-TRANSCRIPT_DIR = "자막"
-UNSORTED_DIR = "미분류"
+
 # 대기열 감시 주기(초)
 QUEUE_POLL_SECONDS = 3
 
@@ -44,6 +42,22 @@ def restore_jobs():
     count = jobs.registry.restore()
     if count:
         print("이전 작업 {}건을 복원했습니다.".format(count))
+
+
+@app.on_event("startup")
+def tidy_channel_dirs():
+    """저장 폴더에 남은 옛 부기 파일을 앱 폴더로 치운다.
+
+    engine.Store도 열릴 때 같은 일을 하지만 그러면 다시 수집하는 채널만
+    정리된다. 폴더를 열었을 때 자막만 보이려면 한 번은 전부 훑어야 한다.
+    """
+    moved = 0
+    for path in iter_channel_dirs():
+        before = len(os.listdir(path))
+        storage.migrate_state(path)
+        moved += before - len(os.listdir(path))
+    if moved:
+        print("자막 폴더에서 부기 파일 {}개를 _state로 옮겼습니다.".format(moved))
 
 
 # --- 요청 모델 ---
@@ -160,13 +174,41 @@ def output_root():
     return load_settings()["output_root"]
 
 
+def iter_channel_dirs():
+    """자막 .txt를 담고 있는 폴더 = 채널 폴더.
+
+    카테고리를 몇 겹으로 두든 상관없도록 깊이를 정하지 않는다
+    (search.iter_transcripts와 같은 규칙).
+    """
+    seen = set()
+    for root in load_settings()["known_roots"]:
+        root = os.path.abspath(root)
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            # 내부용 폴더(_state, _jobs, _index)와 숨김 폴더는 아예 들어가지 않는다
+            dirnames[:] = sorted(d for d in dirnames
+                                 if not d.startswith("_") and not d.startswith("."))
+            if dirpath == root or dirpath in seen:
+                continue
+            if any(f.endswith(".txt") for f in filenames):
+                seen.add(dirpath)
+                yield dirpath
+
+
 def find_channel_dir(folder_name):
     """이미 만들어 둔 채널 폴더를 카테고리 어디에 있든 찾아낸다.
 
-    카테고리로 옮겨둔 채널을 다시 수집할 때 미분류에 새 폴더를 만들면
-    같은 채널의 자막이 두 곳으로 갈라지고, 이미 받은 영상을 처음부터 다시 받는다.
+    카테고리로 옮겨둔 채널을 다시 수집할 때 옆에 새 폴더를 만들면 같은 채널의
+    자막이 두 곳으로 갈라지고, 이미 받은 영상을 처음부터 다시 받는다.
+
+    지금 지정한 저장 위치를 가장 먼저 훑는다 — 같은 이름의 폴더가 여러 곳에
+    있으면 사용자가 지금 고른 곳이 이겨야 한다.
     """
-    for root in load_settings()["known_roots"]:
+    settings = load_settings()
+    roots = [settings["output_root"]] + [
+        r for r in settings["known_roots"] if r != settings["output_root"]]
+    for root in roots:
         if not os.path.isdir(root):
             continue
         for dirpath, dirnames, _ in os.walk(root):
@@ -178,16 +220,12 @@ def find_channel_dir(folder_name):
 
 
 def new_channel_dir(folder):
-    """처음 보는 채널이 들어갈 자리.
+    """처음 보는 채널이 들어갈 자리 — 지정한 저장 위치 바로 아래다.
 
-    저장 위치를 자막/<카테고리> 같은 안쪽 폴더로 지정할 수 있으므로, 거기에
-    또 자막/미분류를 붙이면 자막/AI, 코딩, 개발/자막/미분류/채널 처럼 겹친다.
-    이미 자막 폴더 안을 가리키고 있으면 그 폴더에 채널을 바로 넣는다.
+    예전에는 여기에 자막/미분류를 끼워 넣었다. 사용자가 고른 폴더에 묻지도 않은
+    폴더가 두 겹 생기는 셈이라, 지정한 자리에 채널 폴더만 만든다.
     """
-    root = output_root()
-    if TRANSCRIPT_DIR in os.path.normpath(root).split(os.sep):
-        return os.path.join(root, folder)
-    return os.path.join(root, TRANSCRIPT_DIR, UNSORTED_DIR, folder)
+    return os.path.join(output_root(), folder)
 
 
 def channel_dir(channel_name):
@@ -682,22 +720,39 @@ def group_by_channel(videos):
     return list(groups.values())
 
 
-@app.post("/api/videos/resolve")
-def api_videos_resolve(req: VideoUrlsRequest):
-    """붙여넣은 링크가 어떤 영상인지 확인해 돌려준다 (아직 받지는 않는다)."""
-    urls = parse_video_urls(req.text)
-    if not urls:
-        raise HTTPException(400, "영상 링크를 찾지 못했습니다.")
-    if len(urls) > MAX_VIDEO_URLS:
-        raise HTTPException(400, "한 번에 {}개까지만 넣을 수 있습니다 (지금 {}개).".format(
-            MAX_VIDEO_URLS, len(urls)))
+# --- 링크 해석 ---
 
-    try:
-        videos, failed = channel.resolve_videos(urls)
-    except (RuntimeError, subprocess.TimeoutExpired) as exc:
-        # channel 쪽에서 이미 사람이 읽을 문장을 만들어 준다
-        raise HTTPException(400, str(exc)[:300])
+# 해석은 링크 하나에 2초 남짓, 열댓 개면 몇십 초가 걸리고 채널 수집이 도는 중이면
+# 더 늘어난다. 요청 하나로 끝내면 그동안 화면에 보여줄 것이 없어 멈춘 것처럼
+# 보이므로, 시작만 시켜두고 진행 상황은 따로 물어보게 한다.
+# 작업(jobs)과 달리 짧게 살고 나중에 다시 꺼낼 일이 없어 메모리에만 둔다.
+RESOLVES = {}
+RESOLVES_LOCK = threading.Lock()
+RESOLVE_TTL_SECONDS = 30 * 60
 
+RESOLVE_RUNNING = "running"
+RESOLVE_DONE = "done"
+RESOLVE_ERROR = "error"
+RESOLVE_CANCELLED = "cancelled"
+
+
+def prune_resolves():
+    """오래된 해석 결과를 버린다. 새로 시작할 때마다 한 번씩 훑는다."""
+    cutoff = time.time() - RESOLVE_TTL_SECONDS
+    with RESOLVES_LOCK:
+        for key in [k for k, v in RESOLVES.items() if v["created_at"] < cutoff]:
+            del RESOLVES[key]
+
+
+def require_resolve(resolve_id):
+    entry = RESOLVES.get(resolve_id)
+    if not entry:
+        raise HTTPException(404, "확인한 내용이 남아 있지 않습니다. 다시 확인해 주세요.")
+    return entry
+
+
+def resolve_groups(videos):
+    """해석한 영상을 채널별로 묶어 화면이 쓸 모양으로 만든다."""
     groups = []
     for group in group_by_channel(videos):
         out_dir = channel_dir(group["channel_name"])
@@ -717,21 +772,38 @@ def api_videos_resolve(req: VideoUrlsRequest):
             "videos": items,
             "already": sum(1 for i in items if i["already"]),
         })
-
-    total = len(videos)
-    remaining = total - sum(g["already"] for g in groups)
-    return {
-        "groups": groups,
-        "failed": failed,
-        "total": total,
-        "remaining": remaining,
-        "seconds": engine.estimate_seconds(remaining),
-    }
+    return groups
 
 
-@app.post("/api/videos/jobs")
-def api_videos_jobs(req: VideoUrlsRequest):
-    """개별 영상 수집을 시작한다. 채널별로 작업을 만들어 줄을 세운다."""
+def run_resolve(entry, urls):
+    """해석 스레드 — 진행 숫자를 채우고 끝나면 결과를 담아둔다."""
+    def progress(done, total):
+        entry["done"] = done
+
+    try:
+        videos, failed = channel.resolve_videos(
+            urls, on_progress=progress, cancel=entry["cancel"])
+    except (RuntimeError, subprocess.TimeoutExpired) as exc:
+        # channel 쪽에서 이미 사람이 읽을 문장을 만들어 준다
+        entry["error"] = str(exc)[:300]
+        entry["status"] = RESOLVE_ERROR
+        return
+    except Exception as exc:   # 스레드에서 죽으면 흔적이 남지 않으므로 붙잡는다
+        entry["error"] = "{}: {}".format(type(exc).__name__, exc)[:300]
+        entry["status"] = RESOLVE_ERROR
+        return
+
+    entry["videos"] = videos
+    entry["failed"] = failed
+    entry["groups"] = resolve_groups(videos)
+    entry["done"] = len(videos)
+    entry["status"] = (RESOLVE_CANCELLED if entry["cancel"].is_set()
+                       else RESOLVE_DONE)
+
+
+@app.post("/api/videos/resolve")
+def api_videos_resolve(req: VideoUrlsRequest):
+    """링크 해석을 시작하고 곧바로 돌아온다. 진행 상황은 GET으로 받아간다."""
     urls = parse_video_urls(req.text)
     if not urls:
         raise HTTPException(400, "영상 링크를 찾지 못했습니다.")
@@ -739,11 +811,87 @@ def api_videos_jobs(req: VideoUrlsRequest):
         raise HTTPException(400, "한 번에 {}개까지만 넣을 수 있습니다 (지금 {}개).".format(
             MAX_VIDEO_URLS, len(urls)))
 
-    try:
-        videos, failed = channel.resolve_videos(urls)
-    except (RuntimeError, subprocess.TimeoutExpired) as exc:
-        # channel 쪽에서 이미 사람이 읽을 문장을 만들어 준다
-        raise HTTPException(400, str(exc)[:300])
+    prune_resolves()
+    entry = {
+        "id": uuid.uuid4().hex[:12],
+        "status": RESOLVE_RUNNING,
+        "done": 0,
+        "total": len(urls),
+        "videos": [],
+        "failed": [],
+        "groups": [],
+        "error": None,
+        "created_at": time.time(),
+        "cancel": threading.Event(),
+    }
+    with RESOLVES_LOCK:
+        RESOLVES[entry["id"]] = entry
+    threading.Thread(target=run_resolve, args=(entry, urls), daemon=True).start()
+    return {"resolve_id": entry["id"], "total": entry["total"]}
+
+
+@app.get("/api/videos/resolve/{resolve_id}")
+def api_videos_resolve_state(resolve_id: str):
+    """확인 화면이 1초마다 물어보는 것 — 몇 개까지 됐고, 끝났으면 무엇이 나왔는지."""
+    entry = require_resolve(resolve_id)
+    remaining = sum(len(g["videos"]) - g["already"] for g in entry["groups"])
+    return {
+        "resolve_id": entry["id"],
+        "status": entry["status"],
+        # done/total은 링크 개수 기준이다 — 진행 막대에 쓴다
+        "done": entry["done"],
+        "total": entry["total"],
+        "elapsed": int(time.time() - entry["created_at"]),
+        "error": entry["error"],
+        "groups": entry["groups"],
+        "failed": entry["failed"],
+        "remaining": remaining,
+        "seconds": engine.estimate_seconds(remaining),
+    }
+
+
+@app.post("/api/videos/resolve/{resolve_id}/cancel")
+def api_videos_resolve_cancel(resolve_id: str):
+    """확인을 그만둔다. yt-dlp를 죽이고 그때까지 건진 것만 남긴다."""
+    entry = require_resolve(resolve_id)
+    entry["cancel"].set()
+    return {"ok": True}
+
+
+class VideoJobsRequest(BaseModel):
+    # 확인 단계에서 받은 id. 없으면 text를 직접 해석한다 (열어둔 옛 화면 대비)
+    resolve_id: str = ""
+    text: str = ""
+    options: Options = Options()
+
+
+@app.post("/api/videos/jobs")
+def api_videos_jobs(req: VideoJobsRequest):
+    """개별 영상 수집을 시작한다. 채널별로 작업을 만들어 줄을 세운다.
+
+    확인 단계에서 해석해 둔 결과가 있으면 그대로 쓴다. 여기서 다시 해석하면
+    링크 15개에 몇십 초가 또 들고, 그동안은 작업이 만들어지지 않아 대기열에도
+    아무것도 뜨지 않는다 — 눌러도 아무 일이 없는 것처럼 보이던 원인이다.
+    """
+    if req.resolve_id:
+        entry = require_resolve(req.resolve_id)
+        if entry["status"] == RESOLVE_RUNNING:
+            raise HTTPException(400, "링크를 아직 확인하는 중입니다.")
+        if entry["status"] == RESOLVE_ERROR:
+            raise HTTPException(400, entry["error"] or "링크를 확인하지 못했습니다.")
+        videos, failed = entry["videos"], entry["failed"]
+    else:
+        urls = parse_video_urls(req.text)
+        if not urls:
+            raise HTTPException(400, "영상 링크를 찾지 못했습니다.")
+        if len(urls) > MAX_VIDEO_URLS:
+            raise HTTPException(400, "한 번에 {}개까지만 넣을 수 있습니다 (지금 {}개).".format(
+                MAX_VIDEO_URLS, len(urls)))
+        try:
+            videos, failed = channel.resolve_videos(urls)
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            raise HTTPException(400, str(exc)[:300])
+
     if not videos:
         raise HTTPException(400, "해석할 수 있는 영상이 없습니다.")
 

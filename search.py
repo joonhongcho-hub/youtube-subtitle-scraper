@@ -14,6 +14,8 @@ import re
 import sqlite3
 import time
 
+import storage
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 색인은 저장 폴더가 아니라 앱 폴더에 둔다. 저장 위치는 바뀔 수 있고,
 # 그때마다 색인이 갈라지면 예전 자막이 검색에서 사라진다.
@@ -78,8 +80,9 @@ def _channel_meta(channel_dir):
 
     파일명은 정제 과정에서 특수문자가 치환되고 100자로 잘리지만,
     processed_ids.json에는 원본 제목과 URL이 그대로 남아 있다.
+    이 기록은 채널 폴더가 아니라 앱 안쪽(storage.state_dir)에 있다.
     """
-    path = os.path.join(channel_dir, "processed_ids.json")
+    path = os.path.join(storage.state_dir(channel_dir), "processed_ids.json")
     by_file = {}
     try:
         with open(path, encoding="utf-8") as f:

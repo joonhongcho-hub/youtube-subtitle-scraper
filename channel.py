@@ -3,10 +3,12 @@
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
+import urllib.request
 
 import storage
 from subtitle import BROWSER_UA
@@ -353,6 +355,80 @@ def fetch_channel_meta(url):
         "subscribers": data.get("channel_follower_count"),
         "thumbnail": _best_thumbnail(data),
     }
+
+
+# 채널 '정보' 탭에서 총개수를 읽는 데 쓰는 값들.
+ABOUT_TIMEOUT = 15
+# 개수가 들어 있는 구조의 이름. 같은 페이지에 붙는 추천 채널 카드도
+# videoCountText를 갖고 있어서, 이 이름으로 찾아야 남의 개수를 집지 않는다.
+ABOUT_NODE = "aboutChannelViewModel"
+
+
+def _initial_data(html):
+    """페이지에 박혀 있는 ytInitialData를 꺼낸다."""
+    match = re.search(r"ytInitialData\s*=\s*(\{.*?\});</script>", html, re.S)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(1))
+    except ValueError:
+        return None
+
+
+def _find_node(node, key):
+    """중첩된 어디에 있든 key를 가진 값을 찾아 돌려준다."""
+    if isinstance(node, dict):
+        if key in node:
+            return node[key]
+        for value in node.values():
+            found = _find_node(value, key)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _find_node(value, key)
+            if found is not None:
+                return found
+    return None
+
+
+def fetch_channel_total(channel_url):
+    """채널의 총 영상 수(일반+쇼츠+라이브)를 '정보' 탭에서 가져온다 (약 0.6초).
+
+    탭별 목록을 통째로 받으면 20초가 넘게 걸리는데, 유튜브 자신은 '정보' 패널에
+    총개수를 갖고 있다. 화면이 그 20초 동안 빈 채로 있지 않게 이 값을 먼저 띄운다.
+
+    문서화된 경로가 아니라 페이지 구조가 바뀌면 조용히 못 찾는다. 그래서 무슨 일이
+    있어도 예외를 올리지 않고 None만 돌려준다 — 화면은 지금처럼 탭별 집계를
+    기다리면 되고, 없어도 수집은 아무 지장이 없다.
+    """
+    url = "{}/about".format(channel_url.rstrip("/"))
+    try:
+        request = urllib.request.Request(url, headers={
+            "User-Agent": BROWSER_UA,
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        with urllib.request.urlopen(request, timeout=ABOUT_TIMEOUT) as response:
+            html = response.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+
+    data = _initial_data(html)
+    about = _find_node(data, ABOUT_NODE) if data else None
+    if not isinstance(about, dict):
+        return None
+    # '정보' 패널은 "동영상 2,576개" 같은 문자열이고, 추천 채널 카드는 runs 객체다.
+    # 숫자만 뽑으므로 "2,576 videos" 처럼 언어가 달라도 그대로 걸린다.
+    text = about.get("videoCountText")
+    if not isinstance(text, str):
+        return None
+    match = re.search(r"[\d,]+", text)
+    if not match:
+        return None
+    try:
+        return int(match.group(0).replace(",", ""))
+    except ValueError:
+        return None
 
 
 def fetch_playlists(channel_base_url):

@@ -365,13 +365,14 @@ def api_search(req: SearchRequest):
     return {"is_url": False, "candidates": candidates[:8]}
 
 
-@app.get("/api/channel/meta")
-def api_channel_meta(url: str):
-    """썸네일·구독자 수 (약 1초)."""
-    try:
-        return channel.fetch_channel_meta(url)
-    except RuntimeError as exc:
-        raise HTTPException(400, str(exc))
+@app.get("/api/channel/total")
+def api_channel_total(url: str):
+    """채널 총 영상 수 (약 0.6초).
+
+    탭별 집계는 목록을 통째로 받아야 해서 20초가 넘는다. 그동안 화면이 빈 채로
+    있지 않도록 이 값을 먼저 띄운다. 못 구하면 null — 화면은 탭별 집계를 기다린다.
+    """
+    return {"total": channel.fetch_channel_total(channel.channel_base(url))}
 
 
 ALL_SOURCES = ("videos", "shorts", "streams")
@@ -380,10 +381,12 @@ ALL_SOURCES = ("videos", "shorts", "streams")
 def count_sources(base, force=False):
     """탭별 영상 개수를 센다.
 
-    유튜브가 총개수를 주지 않아 목록을 통째로 받아야만 안다(약 21초).
-    탭 3개를 병렬로 받아 가장 느린 쇼츠 기준 약 12초로 줄인다.
-    결과는 수집 때 쓰는 채널 폴더에 캐시되므로, 여기서 한 번 세어두면
-    수집 범위 화면이 그 캐시를 그대로 재사용한다.
+    유튜브가 탭별 개수를 주지 않아 목록을 통째로 받아야만 안다(약 21초).
+    탭 3개를 병렬로 받아 가장 느린 쇼츠 기준 약 12초로 줄인다. 어차피 필터·정렬·
+    수집에 그 목록이 필요하므로 받은 김에 캐시해 두고 수집이 그대로 쓴다.
+
+    총개수만 필요하면 fetch_channel_total()이 0.6초에 준다 — 화면은 그것을 먼저
+    띄우고 여기서 오는 탭별 내역으로 바꾼다.
     """
     meta = channel.fetch_channel_meta(base)
     name = meta["name"] or "channel"
@@ -423,18 +426,9 @@ def count_sources(base, force=False):
     }
 
 
-@app.get("/api/channel/counts")
-def api_channel_counts(url: str, force: bool = False):
-    """검색 카드용 — 일반 영상·쇼츠·라이브를 합친 개수."""
-    try:
-        return count_sources(channel.channel_base(url), force=force)
-    except RuntimeError as exc:
-        raise HTTPException(400, str(exc))
-
-
 @app.post("/api/channel/sources")
 def api_channel_sources(req: SourcesRequest):
-    """탭별 개수와 예상 소요 시간. 카드에서 이미 셌다면 캐시로 즉시 응답한다."""
+    """탭별 개수와 예상 소요 시간. 목록 캐시가 있으면 즉시 응답한다."""
     try:
         return count_sources(channel.channel_base(req.channel_url), force=req.force)
     except RuntimeError as exc:

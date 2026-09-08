@@ -337,18 +337,42 @@ $('refreshBtn').addEventListener('click', () => loadSources(true));
 
 async function selectChannel(candidate) {
   state.channel = candidate;
+  state.channel.total = null;
   goto(2);
-  await loadSources(false);
+  loadChannelTotal();          // 0.6초 — 먼저 뜬다
+  await loadSources(false);    // 20초 — 탭별 내역으로 바뀐다
   loadPlaylists();
 }
 
+// 탭별 집계는 목록을 통째로 받아야 해서 20초가 넘는다. 유튜브가 '정보' 탭에
+// 세어둔 총개수를 먼저 띄워, 그동안 화면이 비어 있지 않게 한다.
+async function loadChannelTotal() {
+  const url = state.channel.url;
+  try {
+    const data = await api(`/api/channel/total?url=${encodeURIComponent(url)}`);
+    // 기다리는 사이 다른 채널로 옮겼으면 버린다
+    if (state.channel.url !== url || data.total == null) return;
+    state.channel.total = data.total;
+    if (!state.channel.counts) renderChannelHead();
+  } catch (err) {
+    // 못 구해도 그만 — 곧 탭별 집계가 정확한 값을 준다
+  }
+}
+
+// 개수는 세 단계로 보여준다 — 아직 모름 → 총개수만 → 탭별 내역까지.
 function renderChannelHead() {
   const counts = state.channel.counts;
-  const total = counts
-    ? `<div class="text-sm mt-1">전체 영상 <b>${formatCount(counts.total)}개</b>
+  let total;
+  if (counts) {
+    total = `<div class="text-sm mt-1">전체 영상 <b>${formatCount(counts.total)}개</b>
          <span class="text-slate-400">(${counts.sources.map(
-           (s) => `${SOURCE_LABEL[s.source]} ${formatCount(s.count)}`).join(' · ')})</span></div>`
-    : '<div class="text-sm text-slate-400 mt-1">영상 개수를 세는 중…</div>';
+           (s) => `${SOURCE_LABEL[s.source]} ${formatCount(s.count)}`).join(' · ')})</span></div>`;
+  } else if (state.channel.total != null) {
+    total = `<div class="text-sm mt-1">전체 영상 <b>${formatCount(state.channel.total)}개</b>
+         <span class="text-slate-400">· 탭별로 세는 중…</span></div>`;
+  } else {
+    total = '<div class="text-sm text-slate-400 mt-1">영상 개수를 세는 중…</div>';
+  }
 
   $('chanHead').innerHTML = `
     <div class="flex items-center gap-4">
@@ -364,7 +388,7 @@ function renderChannelHead() {
 async function loadSources(force) {
   renderChannelHead();
   $('sources').innerHTML =
-    '<div class="text-sm text-slate-400 py-4">영상 개수를 세는 중… (약 20초)</div>';
+    '<div class="text-sm text-slate-400 py-4">탭별로 나눠 세는 중… (약 20초)</div>';
   $('startBtn').disabled = true;
 
   try {

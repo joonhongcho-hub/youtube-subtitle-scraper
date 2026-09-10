@@ -29,6 +29,12 @@ DATA_DIR = os.path.join(ROOT, "data")
 SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
 CHANNELS_PATH = os.path.join(CONFIG_DIR, "channels.json")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
+# 채널 탭이 읽을 한 벌. 코워크가 이 파일만 보고 페이지를 그린다.
+STATUS_PATH = os.path.join(DATA_DIR, "status.json")
+
+# channels.json 에 올 수 있는 값. 여기 없는 값이 오면 수집을 시작하지 않는다.
+ROLES = ("news", "material")
+STATES = ("confirmed", "pending", "failed")
 
 # 기준일이 아예 없는 채널을 처음 돌릴 때 얼마나 거슬러 올라갈지
 FIRST_RUN_DAYS = 14
@@ -72,6 +78,64 @@ def week_id(today=None):
 def default_since():
     day = datetime.date.today() - datetime.timedelta(days=FIRST_RUN_DAYS)
     return day.strftime("%Y%m%d")
+
+
+def validate_channels(config):
+    """channels.json 형식을 확인한다. 어긋나면 수집을 시작하지 않고 멈춘다.
+
+    코워크가 덮어쓰는 파일이라 형식이 깨질 수 있다. 기본값으로 얼버무리고
+    진행하면 잘못된 목록으로 몇 시간을 돌리게 된다. 그게 가장 나쁘다.
+    """
+    entries = config.get("channels")
+    if not isinstance(entries, list):
+        die("channels.json 에 channels 배열이 없습니다.")
+
+    problems, seen = [], {}
+    for i, entry in enumerate(entries):
+        where = "channels[{}]".format(i)
+        if not isinstance(entry, dict):
+            problems.append("{}: 객체가 아닙니다 ({!r})".format(where, entry))
+            continue
+
+        name = entry.get("name")
+        if not isinstance(name, str) or not name.strip():
+            problems.append("{}: name 이 비어 있습니다 (지금 {!r})".format(where, name))
+        else:
+            where = '{} "{}"'.format(where, name)
+            if name in seen:
+                problems.append("{}: name 이 channels[{}] 와 중복됩니다".format(
+                    where, seen[name]))
+            seen[name] = i
+
+        url = entry.get("url")
+        if not isinstance(url, str) or not url.strip():
+            problems.append("{}: url 이 없습니다".format(where))
+        elif not channel._is_url(url):
+            # 이름만 있으면 resolve_channel 이 사람에게 번호를 물어본다.
+            # 예약 실행에는 답할 사람이 없으므로 시작 전에 잡는다.
+            problems.append("{}: url 이 링크가 아닙니다 ({!r})".format(where, url))
+
+        if entry.get("role") not in ROLES:
+            problems.append("{}: role 은 {} 중 하나여야 합니다 (지금 {!r})".format(
+                where, " 또는 ".join(ROLES), entry.get("role")))
+
+        if not isinstance(entry.get("active"), bool):
+            problems.append("{}: active 는 true/false 여야 합니다 (지금 {!r})".format(
+                where, entry.get("active")))
+
+        # state 는 없으면 confirmed 로 본다. 있으면 아는 값이어야 한다.
+        if entry.get("state", "confirmed") not in STATES:
+            problems.append("{}: state 는 {} 중 하나여야 합니다 (지금 {!r})".format(
+                where, " / ".join(STATES), entry.get("state")))
+
+    if not problems:
+        return
+    print("[중단] channels.json 형식이 맞지 않습니다 ({}건):".format(len(problems)),
+          file=sys.stderr)
+    for problem in problems:
+        print("  - {}".format(problem), file=sys.stderr)
+    print("\n고치기 전에는 수집하지 않습니다.", file=sys.stderr)
+    sys.exit(1)
 
 
 def news_channels(config):
@@ -189,6 +253,85 @@ def _summary(name, out_dir, video_ids, store, since):
     }
 
 
+def count_txt(folder):
+    """폴더의 자막 개수. 폴더가 없으면 None — 0 과 구분해야 사유를 적을 수 있다."""
+    if not os.path.isdir(folder):
+        return None
+    try:
+        return sum(1 for name in os.listdir(folder) if name.endswith(".txt"))
+    except OSError:
+        return None
+
+
+def status_folder(settings, entry, summary):
+    """total_files 를 셀 폴더.
+
+    이번에 수집한 채널은 자막이 실제로 떨어진 폴더를 그대로 쓴다. 나머지는
+    channels.json 의 name 으로 만든다 — 유튜브가 부르는 채널명을 모르기 때문이다.
+    둘이 어긋나면 폴더를 못 찾고, 그 사실은 note 에 그대로 드러난다.
+    """
+    if summary and summary.get("out_dir"):
+        return summary["out_dir"]
+    parts = [settings["output_root"]]
+    folder = entry.get("category_folder")
+    if folder:
+        parts.append(folder)
+    parts.append(storage.sanitize_filename(entry["name"]))
+    return os.path.join(*parts)
+
+
+def build_status(config, settings, state, summaries, failures, targets,
+                 week, ran_at, missing):
+    """채널 탭이 읽을 한 벌.
+
+    수집 대상이 아니었던 채널도 빠짐없이 넣는다 — 화면에는 목록 전체가 떠야 한다.
+    절대 경로와 자막 본문은 넣지 않는다. 코워크가 그대로 페이지에 올릴 파일이라
+    가벼워야 한다.
+    """
+    done = {s["name"]: s for s in summaries}
+    failed = {}
+    for item in failures:
+        failed[item["channel"]] = failed.get(item["channel"], 0) + 1
+
+    channels = []
+    for entry in config["channels"]:
+        name = entry["name"]
+        summary = done.get(name)
+        total = count_txt(status_folder(settings, entry, summary))
+
+        marks = []
+        if name not in targets:
+            marks.append("이번 실행 대상 아님")
+        if failed.get(name):
+            marks.append("수집 실패 {}건".format(failed[name]))
+        if total is None:
+            marks.append("폴더 없음")
+
+        channels.append({
+            "name": name,
+            "role": entry.get("role"),
+            "active": bool(entry.get("active", True)),
+            "state": entry.get("state", "confirmed"),
+            "last_collected": state["channels"].get(name, {}).get("last_success"),
+            "last_count": summary["collected"] if summary else 0,
+            "total_files": total or 0,
+            "last_failed": failed.get(name, 0),
+            "note": " · ".join(marks),
+        })
+
+    return {
+        "updated": ran_at,
+        "last_run": {
+            "week": week,
+            "ran_at": ran_at,
+            "collected": sum(c["last_count"] for c in channels),
+            "failed": len(failures),
+            "missing_files": len(missing),
+        },
+        "channels": channels,
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="뉴스 채널 신규 자막 수집")
     parser.add_argument("--dry-run", action="store_true",
@@ -200,6 +343,8 @@ def main(argv=None):
 
     settings = read_json(SETTINGS_PATH, "settings.json")
     config = read_json(CHANNELS_PATH, "channels.json")
+    # 네트워크를 건드리기 전에 목록부터 확인한다
+    validate_channels(config)
     if not settings.get("output_root"):
         die("settings.json 에 output_root 가 없습니다.")
     settings["output_root"] = resolve_root(settings)
@@ -262,11 +407,17 @@ def main(argv=None):
     storage.save_json(out_path, result)
     storage.save_json(STATE_PATH, state)
 
+    status = build_status(config, settings, state, channels, failures,
+                          {t["name"] for t in targets}, week, result["ran_at"],
+                          missing)
+    storage.save_json(STATUS_PATH, status)
+
     total = sum(c["collected"] for c in channels)
     print("\n" + "=" * 46)
     print("{} — 수집 {}편 / 실패 {}건 / 파일없음 {}건".format(
         week, total, len(failures), len(missing)))
     print(out_path)
+    print(STATUS_PATH)
     print("=" * 46)
     # 부분 성공을 정상으로 본다. 실패는 JSON 에 남아 코워크가 읽는다.
     return 0

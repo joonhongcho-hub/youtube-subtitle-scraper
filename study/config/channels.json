@@ -1,6 +1,6 @@
 {
   "updated": "20260910",
-  "note": "일요일에 코워크가 화면 저장소를 읽어 이 파일을 다시 쓴다. 맥 쪽 코드는 읽기만 한다.",
+  "note": "일요일에 코워크가 화면 저장소를 읽어 이 파일을 다시 쓴다. 맥 쪽 코드는 읽기만 한다. 수집 이력은 여기 두지 않는다 — data/state.json 과 data/status.json 이 갖는다.",
   "channels": [
     {
       "name": "Fireship",
@@ -8,8 +8,7 @@
       "role": "news",
       "active": true,
       "category_folder": "AI, 코딩, 개발",
-      "state": "confirmed",
-      "last_collected": null
+      "state": "confirmed"
     },
     {
       "name": "Matt Wolfe",
@@ -17,8 +16,7 @@
       "role": "news",
       "active": true,
       "category_folder": "AI, 코딩, 개발",
-      "state": "confirmed",
-      "last_collected": null
+      "state": "confirmed"
     },
     {
       "name": "조코딩 JoCoding",
@@ -26,17 +24,15 @@
       "role": "news",
       "active": true,
       "category_folder": "AI, 코딩, 개발",
-      "state": "confirmed",
-      "last_collected": null
+      "state": "confirmed"
     },
     {
       "name": "라이프해커,자청",
       "url": "https://www.youtube.com/channel/UCONUFWDbb9Y338NVLGQid3Q",
-      "role": "textbook",
+      "role": "material",
       "active": true,
       "category_folder": "자기계발, 사업",
-      "state": "confirmed",
-      "last_collected": "20260908"
+      "state": "confirmed"
     }
   ]
 }

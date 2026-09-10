@@ -30,7 +30,24 @@ def parse_args(argv=None):
     parser.add_argument("--lang", default="ko,en", help="자막 언어 우선순위 (기본: ko,en)")
     parser.add_argument("--timestamps", action="store_true",
                         help="자막에 [00:12] 형태의 시각을 남긴다")
+    parser.add_argument("--since", default=None, metavar="YYYYMMDD",
+                        help="이 날짜 이후(당일 포함) 업로드된 영상만 처리")
     return parser.parse_args(argv)
+
+
+def filter_since(videos, since):
+    """since(YYYYMMDD) 이후 업로드된 영상만 남긴다.
+
+    업로드일을 알 수 없는 영상(00000000)은 남긴다 — 놓치는 것보다 중복이 낫다.
+    이미 받은 영상은 뒤에서 processed_ids.json이 다시 걸러낸다.
+    """
+    kept = []
+    for video in videos:
+        raw = str(video.get("upload_date") or "")
+        known = len(raw) == 8 and raw.isdigit() and raw != "00000000"
+        if not known or raw >= since:
+            kept.append(video)
+    return kept
 
 
 def cli_log(level, message):
@@ -108,6 +125,10 @@ def main(argv=None):
     listing = channel.fetch_video_list(resolved["url"], out_dir)
     videos = listing["videos"]
     print("\n채널: {} — 총 영상 {}개".format(channel_name, len(videos)))
+
+    if args.since:
+        videos = filter_since(videos, args.since)
+        print("--since {} 적용 → {}개만 처리합니다.".format(args.since, len(videos)))
 
     if args.limit is not None:
         videos = videos[: args.limit]

@@ -6,6 +6,9 @@ venv/
 output/
 output-*/
 
+# 학습 파이프라인의 실행 기록과 기준일 — 이 맥에서만 의미가 있다
+study/data/
+
 # 파이썬
 __pycache__/
 *.py[cod]

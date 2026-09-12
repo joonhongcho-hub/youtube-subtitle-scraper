@@ -1,4 +1,5 @@
 {
+  "schema": 1,
   "updated": "20260910",
   "note": "일요일에 코워크가 화면 저장소를 읽어 이 파일을 다시 쓴다. 맥 쪽 코드는 읽기만 한다. 수집 이력은 여기 두지 않는다 — data/state.json 과 data/status.json 이 갖는다.",
   "channels": [

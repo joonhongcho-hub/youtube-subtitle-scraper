@@ -4,6 +4,7 @@
 자막을 파일로 떨구고, 무엇을 받았는지 JSON으로 남기는 것까지가 전부다.
 
     python study/collect.py [--dry-run] [--only 채널명] [--limit N]
+                            [--config-dir 폴더]
 
 기준일은 요일이 아니라 config/../data/state.json 의 last_success 다.
 맥이 꺼져 2주를 건너뛰어도 다음 실행에서 2주치를 받는다.
@@ -24,13 +25,16 @@ import engine       # noqa: E402
 import storage      # noqa: E402
 import subtitle     # noqa: E402
 
-CONFIG_DIR = os.path.join(ROOT, "config")
+# 설정 폴더는 --config-dir 로 바꿀 수 있다. 원본 설정을 건드리지 않고 시험하려고 둔다.
+DEFAULT_CONFIG_DIR = os.path.join(ROOT, "config")
 DATA_DIR = os.path.join(ROOT, "data")
-SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
-CHANNELS_PATH = os.path.join(CONFIG_DIR, "channels.json")
+COLLECTED_DIR = os.path.join(DATA_DIR, "collected")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
-# 채널 탭이 읽을 한 벌. 코워크가 이 파일만 보고 페이지를 그린다.
+# 채널 탭이 읽을 한 벌. 맥이 쓰고 코워크는 읽기만 한다.
 STATUS_PATH = os.path.join(DATA_DIR, "status.json")
+
+# 주고받는 JSON 의 형식 번호. 형식을 바꾸면 번호를 올리고 양쪽을 같이 고친다.
+SCHEMA = 1
 
 # channels.json 에 올 수 있는 값. 여기 없는 값이 오면 수집을 시작하지 않는다.
 ROLES = ("news", "material")
@@ -80,12 +84,68 @@ def default_since():
     return day.strftime("%Y%m%d")
 
 
+def check_schema(data, what):
+    """형식 번호를 확인한다. 모르는 번호면 수집을 시작하지 않는다.
+
+    같은 파일을 코워크와 맥이 번갈아 읽고 쓴다. 형식이 바뀐 줄 모르고 옛 코드가
+    읽으면 필드를 조용히 놓친 채로 몇 시간을 돈다. 번호부터 맞춘다.
+    """
+    schema = data.get("schema")
+    if schema != SCHEMA:
+        die("{} 의 schema 가 {} 이어야 합니다 (지금 {!r}). "
+            "형식을 확인하고 고친 뒤 다시 실행하세요.".format(what, SCHEMA, schema))
+
+
+def load_week(path, week):
+    """주차 파일을 실행 목록(runs) 형태로 읽는다. 없으면 빈 채로 시작한다.
+
+    한 주에 두 번 돌 수 있다. 매번 덮어쓰면 먼저 받은 실행이 사라져 주간 누계를
+    낼 근거가 없어진다. 실제로 3편을 받은 실행이 그렇게 사라진 적이 있다.
+    """
+    if not os.path.exists(path):
+        return {"schema": SCHEMA, "week": week, "runs": []}
+
+    doc = read_json(path, "주차 파일")
+    if "runs" in doc:
+        check_schema(doc, os.path.basename(path))
+        if not isinstance(doc["runs"], list):
+            die("{} 의 runs 가 배열이 아닙니다.".format(path))
+        doc.setdefault("week", week)
+        return doc
+
+    # runs 가 없던 옛 형식 — 통째로 첫 실행으로 감싸 옮긴다. 지우지 않는다.
+    return {
+        "schema": SCHEMA,
+        "week": doc.get("week") or week,
+        "runs": [{
+            "ran_at": doc.get("ran_at"),
+            "channels": doc.get("channels") or [],
+            "failures": doc.get("failures") or [],
+            "missing_files": doc.get("missing_files") or [],
+        }],
+    }
+
+
+def week_total(week, doc):
+    """주차 파일에 쌓인 실행을 모두 합한다."""
+    collected = failed = 0
+    runs = doc.get("runs") or []
+    for run in runs:
+        for item in run.get("channels") or []:
+            collected += item.get("collected") or 0
+        failed += len(run.get("failures") or [])
+    return {"week": week, "collected": collected, "failed": failed,
+            "runs": len(runs)}
+
+
 def validate_channels(config):
     """channels.json 형식을 확인한다. 어긋나면 수집을 시작하지 않고 멈춘다.
 
     코워크가 덮어쓰는 파일이라 형식이 깨질 수 있다. 기본값으로 얼버무리고
     진행하면 잘못된 목록으로 몇 시간을 돌리게 된다. 그게 가장 나쁘다.
     """
+    check_schema(config, "channels.json")
+
     entries = config.get("channels")
     if not isinstance(entries, list):
         die("channels.json 에 channels 배열이 없습니다.")
@@ -281,12 +341,15 @@ def status_folder(settings, entry, summary):
 
 
 def build_status(config, settings, state, summaries, failures, targets,
-                 week, ran_at, missing):
+                 week, ran_at, missing, totals):
     """채널 탭이 읽을 한 벌.
 
     수집 대상이 아니었던 채널도 빠짐없이 넣는다 — 화면에는 목록 전체가 떠야 한다.
     절대 경로와 자막 본문은 넣지 않는다. 코워크가 그대로 페이지에 올릴 파일이라
     가벼워야 한다.
+
+    flags 에는 코드 문자열만 넣는다. 화면에 뜰 문구는 페이지가 만든다 — 여기에
+    한국어를 넣으면 문구 하나 고치려고 맥 코드를 고치게 된다.
     """
     done = {s["name"]: s for s in summaries}
     failed = {}
@@ -298,36 +361,43 @@ def build_status(config, settings, state, summaries, failures, targets,
         name = entry["name"]
         summary = done.get(name)
         total = count_txt(status_folder(settings, entry, summary))
+        known = state["channels"].get(name, {})
+        last_at = known.get("last_content_at")
 
-        marks = []
+        flags = []
         if name not in targets:
-            marks.append("이번 실행 대상 아님")
-        if failed.get(name):
-            marks.append("수집 실패 {}건".format(failed[name]))
-        if total is None:
-            marks.append("폴더 없음")
+            flags.append("not_targeted")
+        if last_at is None and total:
+            # 받은 기록은 없는데 자막이 있다. 다른 경로로 받았다는 신호다.
+            # 화면이 "한 번도 수집 안 함 / 19편 보유"를 그대로 그리지 않게 한다.
+            flags.append("orphan_files")
 
         channels.append({
             "name": name,
             "role": entry.get("role"),
             "active": bool(entry.get("active", True)),
             "state": entry.get("state", "confirmed"),
-            "last_collected": state["channels"].get(name, {}).get("last_success"),
-            "last_count": summary["collected"] if summary else 0,
-            "total_files": total or 0,
+            # 날짜와 편수는 늘 같은 실행을 가리킨다 — 마지막으로 1편 이상 받은 실행
+            "last_content_at": last_at,
+            "last_count": known.get("last_content_count", 0),
+            "this_run": summary["collected"] if summary else 0,
+            # 폴더가 없으면 null. 0(폴더는 있는데 빔)과 다른 상태다.
+            "total_files": total,
             "last_failed": failed.get(name, 0),
-            "note": " · ".join(marks),
+            "flags": flags,
         })
 
     return {
+        "schema": SCHEMA,
         "updated": ran_at,
         "last_run": {
             "week": week,
             "ran_at": ran_at,
-            "collected": sum(c["last_count"] for c in channels),
+            "collected": sum(c["this_run"] for c in channels),
             "failed": len(failures),
             "missing_files": len(missing),
         },
+        "week_total": totals,
         "channels": channels,
     }
 
@@ -339,10 +409,13 @@ def main(argv=None):
     parser.add_argument("--only", default=None, help="이 채널만 처리")
     parser.add_argument("--limit", type=int, default=None,
                         help="채널당 N개까지만 (테스트용)")
+    parser.add_argument("--config-dir", default=None,
+                        help="설정을 읽을 폴더 (기본: study/config)")
     args = parser.parse_args(argv)
 
-    settings = read_json(SETTINGS_PATH, "settings.json")
-    config = read_json(CHANNELS_PATH, "channels.json")
+    config_dir = args.config_dir or DEFAULT_CONFIG_DIR
+    settings = read_json(os.path.join(config_dir, "settings.json"), "settings.json")
+    config = read_json(os.path.join(config_dir, "channels.json"), "channels.json")
     # 네트워크를 건드리기 전에 목록부터 확인한다
     validate_channels(config)
     if not settings.get("output_root"):
@@ -389,33 +462,45 @@ def main(argv=None):
         channels.append(summary)
         if ok:
             # 성공한 채널만 기준일을 옮긴다. 실패한 채널은 다음에 다시 시도된다.
-            state["channels"][entry["name"]] = {
-                "last_success": today,
-                "last_run": datetime.datetime.now().isoformat(timespec="seconds"),
-            }
+            known = dict(state["channels"].get(entry["name"], {}))
+            # last_success 는 --since 기준일이다. 뜻을 바꾸지 않는다.
+            known["last_success"] = today
+            known["last_run"] = datetime.datetime.now().isoformat(timespec="seconds")
+            if summary["collected"] > 0:
+                # 1편이라도 받았을 때만 옮긴다. 0편 실행이 지난 편수를 지우면
+                # 화면에는 "마지막 수집 0편"이라는 거짓말이 뜬다.
+                known["last_content_at"] = today
+                known["last_content_count"] = summary["collected"]
+            state["channels"][entry["name"]] = known
 
     week = week_id()
-    result = {
-        "week": week,
-        "ran_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+    ran_at = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    os.makedirs(COLLECTED_DIR, exist_ok=True)
+    out_path = os.path.join(COLLECTED_DIR, "{}.json".format(week))
+
+    # 이번 실행은 이번에 받은 것만 담아 뒤에 덧붙인다. 실행끼리 파일이 겹치지 않는다.
+    doc = load_week(out_path, week)
+    doc["runs"].append({
+        "ran_at": ran_at,
         "channels": channels,
         "failures": failures,
         "missing_files": missing,
-    }
-    os.makedirs(os.path.join(DATA_DIR, "collected"), exist_ok=True)
-    out_path = os.path.join(DATA_DIR, "collected", "{}.json".format(week))
-    storage.save_json(out_path, result)
+    })
+    storage.save_json(out_path, doc)
     storage.save_json(STATE_PATH, state)
 
+    totals = week_total(week, doc)
     status = build_status(config, settings, state, channels, failures,
-                          {t["name"] for t in targets}, week, result["ran_at"],
-                          missing)
+                          {t["name"] for t in targets}, week, ran_at,
+                          missing, totals)
     storage.save_json(STATUS_PATH, status)
 
     total = sum(c["collected"] for c in channels)
     print("\n" + "=" * 46)
     print("{} — 수집 {}편 / 실패 {}건 / 파일없음 {}건".format(
         week, total, len(failures), len(missing)))
+    print("{} 누계 — 수집 {}편 / 실패 {}건 / 실행 {}번".format(
+        week, totals["collected"], totals["failed"], totals["runs"]))
     print(out_path)
     print(STATUS_PATH)
     print("=" * 46)

@@ -23,6 +23,32 @@
 수집 이력은 `channels.json`에 두지 않는다. `data/state.json`(맥이 아는 사실)과
 `data/status.json`(화면에 보여줄 값)만 갖는다.
 
+**`status.json`은 맥이 쓰고 코워크는 읽기만 한다.** 코워크가 덧붙일 정보(다음 수집
+예정 등)는 페이지에 올릴 때 붙이고 이 파일은 건드리지 않는다. 맥은 스케줄을 모르므로
+그런 값을 추측해 채우지 않는다.
+
+세 파일(`channels.json` `status.json` `data/collected/{주차}.json`)은 맨 위에
+`"schema": 1`을 갖는다. `collect.py`는 읽을 때 이 번호부터 확인하고, 모르는 번호면
+수집을 시작하지 않는다.
+
+`status.json`의 채널 한 줄은 이렇게 읽는다.
+
+| 필드 | 뜻 |
+|---|---|
+| `last_content_at` / `last_count` | **마지막으로 1편 이상 받은 날과 그때 편수.** 둘은 늘 같은 실행을 가리킨다 |
+| `this_run` | 이번 실행에서 받은 편수 |
+| `total_files` | 폴더의 자막 수. **폴더가 없으면 `null`** — 0(폴더는 있는데 빔)과 다른 상태다 |
+| `flags` | `not_targeted`(이번 실행 대상 아님) · `orphan_files`(기록은 없는데 자막이 있음) |
+
+`flags`에는 코드 문자열만 들어간다. 화면에 뜰 문구는 페이지가 만든다.
+
+`data/collected/{주차}.json`은 그 주의 실행을 `runs` 배열에 **덧붙인다.** 같은 주에
+두 번 돌아도 먼저 받은 실행이 지워지지 않는다. `status.json`의 `week_total`이 이
+배열을 합한 값이다.
+
+기록은 있는데 파일이 없는 상태, 파일은 있는데 기록이 없는 상태를 **자동으로 고치지
+않는다.** `missing_files`와 `flags`에 드러나게만 두고 무엇을 할지는 사람이 정한다.
+
 ## 실행
 
 ```bash
@@ -32,6 +58,9 @@ source venv/bin/activate
 python study/collect.py --dry-run           # 무엇을 받을지만 본다
 python study/collect.py                     # 실제 수집
 python study/collect.py --only Fireship --limit 3
+
+# 원본 설정을 건드리지 않고 시험할 때 — 설정 폴더만 바꾼다
+python study/collect.py --config-dir /tmp/test-config --dry-run
 
 # 유닛 재료 — 코워크가 고른 영상만
 python study/fetch_videos.py --ids Abc123,Def456 --out "챕터1/유닛3"

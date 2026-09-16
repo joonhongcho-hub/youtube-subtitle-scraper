@@ -249,12 +249,17 @@ def collect_channel(entry, settings, state, langs, mode, api, limit=None):
     listing = channel.fetch_entries(resolved["url"], cache_path, force=True, log=log)
     videos = listing["videos"]
 
-    fresh = [v for v in videos if _is_new(v, since)]
+    store = engine.Store(out_dir)
+    candidates = [v for v in videos if _is_new(v, since)]
+    # 이미 받은 영상은 여기서 뺀다. 목록 날짜가 하루 이틀 흔들려 받은 영상이
+    # since 창에 다시 들어오는데, 남겨두면 "이번에 받음"으로 또 세어진다.
+    fresh = [v for v in candidates if not store.is_done(v["video_id"])]
+    skipped = len(candidates) - len(fresh)
     if limit:
         fresh = fresh[:limit]
-    log("info", "전체 {}개 중 신규 후보 {}개".format(len(videos), len(fresh)))
+    log("info", "전체 {}개 중 신규 후보 {}개 (이미 받음 {}개 건너뜀)".format(
+        len(videos), len(fresh), skipped))
 
-    store = engine.Store(out_dir)
     if not fresh:
         return _summary(name, out_dir, [], store, since), True
 

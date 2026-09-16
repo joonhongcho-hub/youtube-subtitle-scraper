@@ -101,12 +101,19 @@ class Store(object):
         return self.records.get(video_id)
 
     def is_done(self, video_id):
-        """성공했거나 재시도해도 소용없는 실패면 건너뛴다."""
+        """성공했거나 재시도해도 소용없는 실패면 건너뛴다.
+
+        성공 기록은 파일이 실제로 있어야 "받음"이다. 사용자가 자막을 지우면
+        기록만 남는데, 기록만 믿으면 화면은 "이미 받음"이라 하고 수집은 건너뛰어
+        지운 자막이 영영 돌아오지 않는다.
+        """
         record = self.records.get(video_id)
         if not record:
             return False
-        return (record["status"] == subtitle.SUCCESS
-                or record["status"] in subtitle.NON_RETRYABLE)
+        if record["status"] == subtitle.SUCCESS:
+            path = record.get("path")
+            return bool(path) and os.path.exists(os.path.join(self.out_dir, path))
+        return record["status"] in subtitle.NON_RETRYABLE
 
     def all_records(self):
         return list(self.records.values())
@@ -129,6 +136,36 @@ class Store(object):
             "detail": r.get("detail", ""),
         } for vid, r in self.records.items() if r["status"] != subtitle.SUCCESS}
         storage.save_json(self.failed_path, failed)
+
+
+def _kept_upload_date(previous, video):
+    """기록에 날짜가 있으면 그것을, 없으면 목록의 날짜를 쓴다.
+
+    채널 목록은 "N일 전"만 줘서 받을 때마다 날짜가 하루 이틀씩 흔들린다.
+    다시 받을 때 그날 목록 날짜를 쓰면 같은 영상이 다른 이름으로 또 저장된다.
+    """
+    raw = str(previous.get("upload_date") or "")
+    if len(raw) == 8 and raw.isdigit() and raw != "00000000":
+        return raw
+    return video["upload_date"]
+
+
+def _write_transcript(out_dir, previous_path, upload_date, title, text):
+    """자막을 쓴다. 전에 저장한 적이 있으면 그 이름에 그대로 덮어쓴다.
+
+    새 이름을 만들면 날짜가 밀리거나 제목이 바뀐 만큼 사본이 생기고,
+    파일이 남아 있으면 _1 이 붙은 사본이 또 생긴다.
+    """
+    if not previous_path:
+        return storage.save_transcript(out_dir, upload_date, title, text)
+    path = os.path.join(out_dir, previous_path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    # 끝 줄바꿈은 storage.save_transcript 와 같은 규칙
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+        if not text.endswith("\n"):
+            f.write("\n")
+    return path
 
 
 def process_videos(videos, channel_name, store, langs, mode, api,
@@ -171,10 +208,11 @@ def process_videos(videos, channel_name, store, langs, mode, api,
             break
 
         previous = store.get(video_id) or {}
+        upload_date = _kept_upload_date(previous, video)
         record = {
             "video_id": video_id,
             "title": video["title"],
-            "upload_date": video["upload_date"],
+            "upload_date": upload_date,
             "url": video["url"],
             "status": result.status,
             "path": previous.get("path", ""),
@@ -184,8 +222,8 @@ def process_videos(videos, channel_name, store, langs, mode, api,
         }
 
         if result.ok:
-            path = storage.save_transcript(
-                store.out_dir, video["upload_date"], video["title"], result.text)
+            path = _write_transcript(store.out_dir, previous.get("path"),
+                                     upload_date, video["title"], result.text)
             record["path"] = os.path.relpath(path, store.out_dir)
             record["char_count"] = len(result.text)
             log(LEVEL_OK, "      저장: {}  ({})".format(

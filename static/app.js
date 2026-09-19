@@ -984,7 +984,9 @@ async function loadQueuePage() {
     }
     if (data.recent.length) {
       parts.push('<h4 class="text-xs font-medium text-slate-400 pt-4">최근 끝난 작업</h4>');
-      data.recent.forEach((j) => parts.push(queueRow(j, j.status)));
+      data.recent.forEach((j) => parts.push(queueRow(j, j.status,
+        `<button class="jobdel text-xs underline text-slate-400 hover:text-red-600 shrink-0"
+                 data-job="${j.job_id}">지우기</button>`)));
     }
     box.innerHTML = parts.join('');
 
@@ -1004,6 +1006,18 @@ async function loadQueuePage() {
       });
     });
 
+    box.querySelectorAll('.jobdel').forEach((btn) => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        btn.disabled = true;
+        try {
+          await api(`/api/jobs/${btn.dataset.job}/delete`, { method: 'POST' });
+        } catch (err) { showError(err.message); }
+        loadQueuePage();
+        loadQueue();
+      });
+    });
+
     box.querySelectorAll('.dequeue').forEach((btn) => {
       btn.addEventListener('click', async (e) => {
         e.stopPropagation();
@@ -1019,6 +1033,20 @@ async function loadQueuePage() {
     box.innerHTML = `<p class="text-sm text-red-600">대기열을 불러오지 못했습니다: ${escapeHtml(err.message)}</p>`;
   }
 }
+
+// 목록에서 지우는 것은 "무엇을 언제 돌렸는지"뿐이다. 받아둔 자막과 이어받기
+// 기록은 그대로 남는다 — 그래서 되돌릴 수 없는 일이 아니다.
+$('clearJobs').addEventListener('click', async () => {
+  if (!confirm('끝난 작업을 목록에서 모두 지웁니다.\n받아둔 자막은 그대로 남습니다.')) return;
+  try {
+    const done = await api('/api/jobs/clear-finished', { method: 'POST' });
+    toast(`작업 기록 ${formatCount(done.removed)}건을 지웠습니다`);
+  } catch (err) {
+    showError(err.message);
+  }
+  loadQueuePage();
+  loadQueue();
+});
 
 // 앞 작업이 끝나 다음 채널이 시작되는 것을 화면이 알아채야 한다.
 // 작업 하나가 몇십 분이라 굳이 촘촘히 볼 필요는 없다.
@@ -1809,8 +1837,11 @@ async function loadScheduleChannels() {
 
 function renderChannels() {
   const folders = sched.folders.map((f) => `<option value="${escapeHtml(f)}">`).join('');
+  // 파일에 적힌 순서(추가한 차례)는 화면에서 찾기 어렵다. 그릴 때만 이름순으로
+  // 세운다 — 파일은 코워크도 쓰므로 화면 사정으로 다시 쓰지 않는다.
+  const rows = [...sched.channels].sort((a, b) => a.name.localeCompare(b.name, 'ko'));
   $('schedChannels').innerHTML = `<datalist id="schedFolders">${folders}</datalist>` +
-    sched.channels.map(channelRow).join('');
+    rows.map(channelRow).join('');
 }
 
 function channelRow(row) {
@@ -1849,6 +1880,7 @@ function channelRow(row) {
       <span class="flex items-center gap-2 px-2 py-1 rounded border border-slate-200">${roles}</span>
       <input class="chFolder w-36 px-2 py-1.5 rounded border border-slate-300 text-sm"
              list="schedFolders" value="${escapeHtml(row.category_folder || '')}" placeholder="저장 폴더">
+      <button class="chPick text-xs px-2 py-1.5 rounded border border-slate-300 hover:bg-slate-50">폴더…</button>
       <button class="chDelete text-xs text-slate-400 hover:text-red-600 px-1">삭제</button>
     </div>
   </div>`;
@@ -1900,6 +1932,15 @@ $('schedChannels').addEventListener('change', (e) => {
 });
 
 $('schedChannels').addEventListener('click', async (e) => {
+  if (e.target.classList.contains('chPick')) {
+    const folder = await pickChannelFolder(e.target);
+    if (folder === null) return;
+    const input = e.target.closest('[data-name]').querySelector('.chFolder');
+    input.value = folder;
+    sched.lastFolder = folder;
+    patchChannel(rowName(e.target), { category_folder: folder }, '저장 폴더를 바꿨습니다');
+    return;
+  }
   if (!e.target.classList.contains('chDelete')) return;
   const name = rowName(e.target);
   if (!confirm(`${name} 을(를) 목록에서 뺍니다.\n받아둔 자막과 기록은 그대로 남습니다.`)) return;
@@ -2105,6 +2146,148 @@ $('logBtn').addEventListener('click', async () => {
   } catch (err) {
     showError(err.message);
   }
+});
+
+// --- 자막 상태 맞추기 ---
+
+// 장부와 폴더가 어긋나면 수집이 조용히 헛돈다. 무엇을 고칠지 먼저 보여주고
+// 사용자가 확인한 뒤에만 적용한다. 자막 파일은 어느 쪽에서도 건드리지 않는다.
+let syncPlan = null;
+
+$('syncBtn').addEventListener('click', async () => {
+  const btn = $('syncBtn');
+  btn.disabled = true;
+  btn.textContent = '대조하는 중…';
+  try {
+    syncPlan = await api('/api/schedule/reconcile');
+    renderSync(syncPlan);
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '자막 상태 맞추기';
+  }
+});
+
+function renderSync(plan) {
+  const box = $('syncResult');
+  const t = plan.totals;
+  box.classList.remove('hidden');
+
+  if (!t.repoint && !t.remove && !t.restore) {
+    box.innerHTML = `<p class="text-sm text-slate-500">맞출 것이 없습니다.${
+      t.unmatched ? ` 짝을 못 찾은 파일이 ${formatCount(t.unmatched)}개 있습니다.` : ''}</p>`
+      + unmatchedList(plan);
+    return;
+  }
+
+  const rows = plan.channels.filter((c) => c.changes || c.unmatched.length).map((c) => `
+    <tr class="border-t border-slate-100">
+      <td class="py-1.5 pr-3">${escapeHtml(c.name)}</td>
+      <td class="py-1.5 px-2 tabular-nums text-right">${c.repoint.length || ''}</td>
+      <td class="py-1.5 px-2 tabular-nums text-right">${c.remove.length || ''}</td>
+      <td class="py-1.5 px-2 tabular-nums text-right">${c.restore.length || ''}</td>
+      <td class="py-1.5 px-2 tabular-nums text-right text-slate-400">${c.unmatched.length || ''}</td>
+      <td class="py-1.5 pl-2 text-xs text-slate-500 tabular-nums">${c.baseline
+        ? `${escapeHtml(c.baseline.from || '없음')} → ${escapeHtml(c.baseline.to)}` : ''}</td>
+    </tr>`).join('');
+
+  box.innerHTML = `
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead class="text-xs text-slate-400">
+          <tr>
+            <th class="text-left font-medium pb-1">채널</th>
+            <th class="text-right font-medium pb-1 px-2">경로 고침</th>
+            <th class="text-right font-medium pb-1 px-2">기록 삭제</th>
+            <th class="text-right font-medium pb-1 px-2">기록 복원</th>
+            <th class="text-right font-medium pb-1 px-2">못 맞춤</th>
+            <th class="text-left font-medium pb-1 pl-2">기준일</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    ${unmatchedList(plan)}
+    <div class="flex items-center gap-3 flex-wrap mt-4 pt-4 border-t border-slate-200">
+      <label class="flex items-center gap-2 text-sm">
+        <input id="syncRollback" type="checkbox" class="w-4 h-4 rounded border-slate-300"${
+  t.baseline ? '' : ' disabled'}>
+        기준일도 되돌린다 ${t.baseline ? `(${formatCount(t.baseline)}개 채널)` : '(되돌릴 채널 없음)'}
+      </label>
+      <span class="flex-1"></span>
+      <button id="syncApply" class="px-5 py-2 rounded-lg bg-slate-900 text-white text-sm font-medium hover:bg-slate-700">적용</button>
+    </div>
+    <p class="text-xs text-slate-400 mt-2">
+      적용 전에 장부를 <code>.bak-오늘날짜</code> 로 백업합니다. 지운 기록의 영상은 다음 수집이 다시 받습니다.
+    </p>`;
+
+  $('syncApply').addEventListener('click', applySync);
+}
+
+function unmatchedList(plan) {
+  const files = [];
+  plan.channels.forEach((c) => c.unmatched.forEach(
+    (u) => files.push(`${c.name} · ${u.file} (${u.reason})`)));
+  if (!files.length) return '';
+  return `<details class="mt-3">
+      <summary class="text-xs text-slate-500 cursor-pointer">복원 못 한 파일 ${formatCount(files.length)}개</summary>
+      <div class="mt-2 space-y-0.5 text-xs text-slate-500 max-h-48 overflow-y-auto">
+        ${files.map((f) => `<div>${escapeHtml(f)}</div>`).join('')}
+      </div>
+    </details>`;
+}
+
+async function applySync() {
+  const btn = $('syncApply');
+  const rollback = $('syncRollback').checked;
+  btn.disabled = true;
+  btn.textContent = '맞추는 중…';
+  try {
+    const done = await api('/api/schedule/reconcile/apply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rollback }),
+    });
+    const sum = done.channels.reduce((acc, c) => ({
+      repoint: acc.repoint + c.repoint,
+      remove: acc.remove + c.remove,
+      restore: acc.restore + c.restore,
+    }), { repoint: 0, remove: 0, restore: 0 });
+    $('syncResult').innerHTML = `<p class="text-sm text-emerald-700">
+      맞췄습니다 — 경로 고침 ${formatCount(sum.repoint)} · 기록 삭제 ${formatCount(sum.remove)}
+      · 기록 복원 ${formatCount(sum.restore)}${rollback ? ' · 기준일도 되돌림' : ''}</p>`;
+    loadScheduleChannels();
+  } catch (err) {
+    showError(err.message);
+    btn.disabled = false;
+    btn.textContent = '적용';
+  }
+}
+
+// --- 저장 폴더 고르기 ---
+
+// 채널별 폴더는 저장 루트 아래의 하위 폴더 이름이다. 파인더가 준 절대경로를
+// 서버가 루트 기준 상대경로로 바꿔 돌려준다 (루트 밖이면 거절한다).
+async function pickChannelFolder(button) {
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = '여는 중…';
+  try {
+    const picked = await api('/api/schedule/pick-folder', { method: 'POST' });
+    return picked.cancelled ? null : picked.folder;
+  } catch (err) {
+    showError(err.message);
+    return null;
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+  }
+}
+
+$('addPick').addEventListener('click', async () => {
+  const folder = await pickChannelFolder($('addPick'));
+  if (folder !== null) $('addFolder').value = folder;
 });
 
 function openScheduleTab() {

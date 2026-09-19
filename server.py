@@ -616,6 +616,36 @@ def api_queue():
     }
 
 
+@app.post("/api/jobs/{job_id}/delete")
+def api_job_delete(job_id: str):
+    """끝난 작업을 목록에서 지운다. 자막과 처리 기록은 그대로 둔다.
+
+    돌고 있거나 줄 서 있는 작업은 거절한다 — 먼저 중지하거나 빼야 한다.
+    지우는 것은 작업 기록(output/_jobs)뿐이다.
+    """
+    job = require_job(job_id)
+    if job.status == jobs.STATUS_RUNNING and job.is_alive():
+        raise HTTPException(400, "돌고 있는 작업입니다. 먼저 중지하세요.")
+    if job.status == jobs.STATUS_QUEUED:
+        raise HTTPException(400, "대기 중인 작업입니다. 먼저 대기열에서 빼세요.")
+    jobs.registry.remove(job_id)
+    return {"ok": True}
+
+
+@app.post("/api/jobs/clear-finished")
+def api_jobs_clear_finished():
+    """끝난 작업을 한 번에 지운다. 돌고 있거나 기다리는 작업은 남긴다."""
+    removed = 0
+    for job in list(jobs.registry.jobs.values()):
+        if job.status == jobs.STATUS_QUEUED:
+            continue
+        if job.status == jobs.STATUS_RUNNING and job.is_alive():
+            continue
+        if jobs.registry.remove(job.id):
+            removed += 1
+    return {"ok": True, "removed": removed}
+
+
 @app.post("/api/jobs/{job_id}/dequeue")
 def api_job_dequeue(job_id: str):
     """차례를 기다리는 작업을 대기열에서 뺀다."""
@@ -1558,6 +1588,46 @@ def api_schedule_run(req: dict = None):
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {"ok": True, "total": started["total"], "limit": limit}
+
+
+@app.post("/api/schedule/pick-folder")
+def api_schedule_pick_folder():
+    """파인더로 폴더를 고르고, 예약 수집의 저장 루트 기준 상대경로로 돌려준다.
+
+    채널별 폴더는 루트 아래 하위 폴더 이름이라 절대경로를 그대로 넣을 수 없다.
+    루트 밖을 고르면 조용히 엉뚱한 곳에 쌓이므로 여기서 막는다.
+    """
+    picked = api_pick_folder()
+    if picked.get("cancelled"):
+        return picked
+
+    root = os.path.abspath(scheduler.load_settings()["output_root"])
+    path = os.path.abspath(picked["path"])
+    if path == root:
+        return {"cancelled": False, "folder": ""}     # 루트 바로 아래
+    try:
+        inside = os.path.commonpath([root, path]) == root
+    except ValueError:                                # 다른 드라이브
+        inside = False
+    if not inside:
+        raise HTTPException(400, "저장 루트 안의 폴더를 고르세요: {}".format(root))
+    return {"cancelled": False, "folder": os.path.relpath(path, root)}
+
+
+@app.get("/api/schedule/reconcile")
+def api_schedule_reconcile():
+    """자막 파일과 장부를 대조해 무엇을 고칠지만 보여준다. 아무것도 바꾸지 않는다."""
+    return scheduler.reconcile_plan(schedule_dir_finder())
+
+
+@app.post("/api/schedule/reconcile/apply")
+def api_schedule_reconcile_apply(req: dict = None):
+    """대조 결과를 적용한다. 자막 파일은 건드리지 않는다."""
+    rollback = bool((req or {}).get("rollback"))
+    try:
+        return scheduler.reconcile_apply(rollback, schedule_dir_finder())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
 
 
 @app.get("/api/schedule/history")

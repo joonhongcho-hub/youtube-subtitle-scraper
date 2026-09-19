@@ -326,5 +326,22 @@ class Registry(object):
         job.save()
         return job
 
+    def remove(self, job_id):
+        """작업 기록을 지운다 — 목록에서 빼고 디스크의 메타·로그도 지운다.
+
+        자막과 처리 기록(_state)은 건드리지 않는다. 지우는 것은 "무엇을 언제
+        돌렸는지"뿐이라, 지워도 이미 받은 자막과 이어받기는 그대로다.
+        """
+        with self._lock:
+            job = self.jobs.pop(job_id, None)
+        if not job:
+            return False
+        for path in (job.meta_path, job.log_path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass      # 이미 없으면 그만이다
+        return True
+
 
 registry = Registry()

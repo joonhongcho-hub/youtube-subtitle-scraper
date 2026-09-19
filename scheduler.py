@@ -28,6 +28,7 @@ import collect      # noqa: E402  (study/collect.py — 장부 규칙을 함께 
 import engine       # noqa: E402
 import jobs         # noqa: E402
 import storage      # noqa: E402
+import subtitle     # noqa: E402
 
 SHARED_DIR = collect.SHARED_CONFIG_DIR
 SCHEDULE_PATH = collect.SCHEDULE_PATH
@@ -530,3 +531,263 @@ def _write_ledger(config, settings, state, summaries, failures, missing, targets
         config, settings, state, summaries, failures,
         {t["name"] for t in targets}, week, ran_at, missing, totals)
     storage.save_json(collect.STATUS_PATH, status)
+
+
+# --- 자막 상태 맞추기 ---------------------------------------------------
+
+# 장부(processed_ids.json)와 폴더의 자막이 어긋나면 수집이 조용히 헛돈다.
+# 파일을 지웠는데 기록이 남아 있으면 다음 수집이 건너뛰고, 다른 경로로 받은
+# 파일에 기록이 없으면 화면에는 "받은 적 없음"으로 뜬다. 여기서 맞추는 것은
+# 기록뿐이다 — 자막 파일은 읽기만 하고 절대 지우거나 옮기지 않는다.
+
+def stem_for(upload_date, title):
+    """자막 파일이 저장될 때 쓰는 이름(확장자 앞부분)을 그대로 만든다."""
+    return storage.sanitize_filename("{}_{}".format(upload_date, title))
+
+
+def txt_files(folder):
+    if not os.path.isdir(folder):
+        return []
+    try:
+        return sorted(n for n in os.listdir(folder) if n.endswith(".txt"))
+    except OSError:
+        return []
+
+
+def listed_videos(folder):
+    """그 채널 폴더에 딸린 목록 캐시(videos.json)의 영상들."""
+    path = os.path.join(storage.state_dir(folder), "videos.json")
+    data = load_json(path, {})
+    videos = data.get("videos") if isinstance(data, dict) else None
+    return [v for v in (videos or []) if isinstance(v, dict) and v.get("video_id")]
+
+
+def match_video(name, videos):
+    """자막 파일 이름에 맞는 영상을 찾는다. (영상, 사유) — 못 찾으면 (None, 사유).
+
+    제목+업로드일로 먼저 맞춰보고, 안 되면 파일 이름의 날짜를 그대로 두고
+    제목만 맞춰본다. 채널 목록이 주는 날짜는 "N일 전"에서 나와 하루 이틀씩
+    흔들리므로, 날짜까지 맞기를 고집하면 멀쩡한 파일을 못 살린다.
+    어느 쪽이든 후보가 **정확히 하나**일 때만 쓴다.
+    """
+    stem = name[:-4] if name.endswith(".txt") else name
+    head = stem.split("_", 1)[0]
+    date_prefix = head if len(head) == 8 and head.isdigit() else ""
+
+    exact = [v for v in videos
+             if stem_for(v.get("upload_date") or "", v.get("title") or "") == stem]
+    if len(exact) == 1:
+        return exact[0], "date+title"
+    if len(exact) > 1:
+        return None, "후보 여럿"
+
+    if date_prefix:
+        loose = [v for v in videos
+                 if stem_for(date_prefix, v.get("title") or "") == stem]
+        if len(loose) == 1:
+            return loose[0], "title"
+        if len(loose) > 1:
+            return None, "후보 여럿"
+    return None, "목록에 없음"
+
+
+def yesterday_of(date8):
+    """YYYYMMDD 의 하루 전. 기준일을 그 영상보다 앞으로 물리려고 쓴다."""
+    try:
+        day = datetime.datetime.strptime(date8, "%Y%m%d").date()
+    except (TypeError, ValueError):
+        return None
+    return (day - datetime.timedelta(days=1)).strftime("%Y%m%d")
+
+
+def known_date(value):
+    raw = str(value or "")
+    return raw if len(raw) == 8 and raw.isdigit() and raw != "00000000" else ""
+
+
+def reconcile_channel(entry, settings, state, find_dir=None):
+    """채널 하나를 대조해 무엇을 고칠지 적어 돌려준다. 아무것도 바꾸지 않는다."""
+    name = entry.get("name") or ""
+    folder = channel_folder(settings, entry, find_dir)
+    records_path = os.path.join(storage.state_dir(folder), "processed_ids.json")
+    records = load_json(records_path, {})
+    if not isinstance(records, dict):
+        records = {}
+
+    files = txt_files(folder)
+    used = {r.get("path") for r in records.values()
+            if isinstance(r, dict) and r.get("path")}
+    orphans = [f for f in files if f not in used]
+
+    # 기록 없는 파일이 어느 영상인지 먼저 알아둔다 — 경로만 어긋난 기록을
+    # 되살릴 때도 이 결과를 쓴다 (지웠다 다시 받는 것보다 낫다).
+    videos = listed_videos(folder)
+    found, unmatched = {}, []
+    for filename in orphans:
+        video, why = match_video(filename, videos)
+        if video and video["video_id"] not in found:
+            found[video["video_id"]] = (filename, video)
+        else:
+            unmatched.append({"file": filename,
+                              "reason": why if not video else "이미 짝이 있음"})
+
+    repoint, remove = [], []
+    for video_id, record in records.items():
+        if not isinstance(record, dict) or record.get("status") != subtitle.SUCCESS:
+            continue          # 실패 기록은 읽지도 고치지도 않는다
+        path = record.get("path") or ""
+        if path and os.path.exists(os.path.join(folder, path)):
+            continue
+        moved = found.pop(video_id, None)
+        if moved:
+            repoint.append({"video_id": video_id, "title": record.get("title", ""),
+                            "old_path": path, "new_path": moved[0]})
+        else:
+            remove.append({"video_id": video_id, "title": record.get("title", ""),
+                           "upload_date": record.get("upload_date", ""),
+                           "path": path})
+
+    restore = [{"video_id": vid, "title": video.get("title") or vid,
+                "file": filename,
+                "upload_date": (filename.split("_", 1)[0]
+                                if known_date(filename.split("_", 1)[0]) else
+                                video.get("upload_date") or "00000000"),
+                "url": video.get("url") or
+                       "https://www.youtube.com/watch?v={}".format(vid)}
+               for vid, (filename, video) in sorted(found.items(),
+                                                    key=lambda kv: kv[1][0])]
+
+    dates = [known_date(item["upload_date"]) for item in remove]
+    oldest = min([d for d in dates if d], default="")
+    baseline = None
+    if oldest:
+        proposed = yesterday_of(oldest)
+        current = state.get("channels", {}).get(name, {}).get("last_success")
+        if proposed and (not current or proposed < current):
+            baseline = {"from": current, "to": proposed}
+
+    return {
+        "name": name,
+        "folder": folder,
+        "records_path": records_path,
+        "total_files": len(files),
+        "repoint": repoint,
+        "remove": remove,
+        "restore": restore,
+        "unmatched": unmatched,
+        "baseline": baseline,
+        "changes": len(repoint) + len(remove) + len(restore),
+    }
+
+
+def reconcile_plan(find_dir=None):
+    """채널 전체를 대조한다. 읽기만 한다."""
+    settings = load_settings()
+    _, config, problems = load_channels()
+    state = load_json(collect.STATE_PATH, {"channels": {}}) or {"channels": {}}
+    state.setdefault("channels", {})
+
+    channels = [reconcile_channel(entry, settings, state, find_dir)
+                for entry in config.get("channels", [])
+                if isinstance(entry, dict)]
+    return {
+        "problems": problems,
+        "channels": channels,
+        "totals": {
+            "repoint": sum(len(c["repoint"]) for c in channels),
+            "remove": sum(len(c["remove"]) for c in channels),
+            "restore": sum(len(c["restore"]) for c in channels),
+            "unmatched": sum(len(c["unmatched"]) for c in channels),
+            "baseline": sum(1 for c in channels if c["baseline"]),
+        },
+    }
+
+
+def backup_records(records_path):
+    """장부를 하루 한 번 백업한다. 같은 날 백업이 있으면 덮지 않는다.
+
+    덮으면 처음 상태가 사라진다. 되돌릴 때 필요한 것은 "손대기 전"이다.
+    """
+    if not os.path.exists(records_path):
+        return None
+    backup = "{}.bak-{}".format(records_path,
+                               datetime.date.today().strftime("%Y%m%d"))
+    if not os.path.exists(backup):
+        shutil.copy2(records_path, backup)
+    return backup
+
+
+def reconcile_apply(rollback=False, find_dir=None):
+    """미리보기와 같은 계산을 다시 해서 장부를 파일에 맞춘다.
+
+    미리보기 뒤에 파일이 바뀌었을 수 있으므로 화면이 보낸 목록을 믿지 않고
+    이 자리에서 다시 센다.
+    """
+    settings = load_settings()
+    _, config, problems = load_channels()
+    if problems:
+        raise ValueError("채널 목록 형식이 맞지 않습니다: {}".format(
+            " / ".join(problems[:3])))
+
+    state = load_json(collect.STATE_PATH, {"channels": {}}) or {"channels": {}}
+    state.setdefault("channels", {})
+
+    done, state_changed = [], False
+    for entry in config.get("channels", []):
+        if not isinstance(entry, dict):
+            continue
+        plan = reconcile_channel(entry, settings, state, find_dir)
+        if not plan["changes"] and not (rollback and plan["baseline"]):
+            continue
+
+        if plan["changes"]:
+            records = load_json(plan["records_path"], {})
+            if not isinstance(records, dict):
+                records = {}
+            backup_records(plan["records_path"])
+
+            for item in plan["repoint"]:
+                records[item["video_id"]]["path"] = item["new_path"]
+            for item in plan["remove"]:
+                records.pop(item["video_id"], None)
+            for item in plan["restore"]:
+                records[item["video_id"]] = {
+                    "video_id": item["video_id"],
+                    "title": item["title"],
+                    "upload_date": item["upload_date"],
+                    "url": item["url"],
+                    "status": subtitle.SUCCESS,
+                    "path": item["file"],
+                    "attempts": 1,
+                    "detail": "",
+                    "char_count": char_count_of(
+                        os.path.join(plan["folder"], item["file"])),
+                }
+            storage.save_json(plan["records_path"], records)
+
+        if rollback and plan["baseline"]:
+            known = dict(state["channels"].get(plan["name"], {}))
+            known["last_success"] = plan["baseline"]["to"]
+            state["channels"][plan["name"]] = known
+            state_changed = True
+
+        done.append({
+            "name": plan["name"],
+            "repoint": len(plan["repoint"]),
+            "remove": len(plan["remove"]),
+            "restore": len(plan["restore"]),
+            "unmatched": len(plan["unmatched"]),
+            "baseline": plan["baseline"] if rollback else None,
+        })
+
+    if state_changed:
+        storage.save_json(collect.STATE_PATH, state)
+    return {"channels": done, "rollback": bool(rollback)}
+
+
+def char_count_of(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return len(f.read())
+    except OSError:
+        return 0

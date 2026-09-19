@@ -283,7 +283,10 @@
     <div class="bg-white rounded-xl border border-slate-200 p-6">
       <div class="flex items-baseline justify-between mb-4">
         <h3 class="font-semibold">대기열</h3>
-        <span class="text-xs text-slate-400">행을 누르면 그 작업 화면으로 갑니다</span>
+        <div class="flex items-center gap-3">
+          <span class="text-xs text-slate-400">행을 누르면 그 작업 화면으로 갑니다</span>
+          <button id="clearJobs" class="text-xs underline text-slate-500 hover:text-red-600">끝난 작업 모두 지우기</button>
+        </div>
       </div>
       <div id="queueList" class="space-y-2"></div>
     </div>
@@ -347,6 +350,15 @@
       <div id="runLog" class="hidden mt-3 p-3 rounded-lg bg-slate-50 border border-slate-200 text-xs font-mono space-y-0.5 max-h-40 overflow-y-auto"></div>
     </div>
 
+    <!-- 자막 상태 맞추기 -->
+    <div class="bg-white rounded-xl border border-slate-200 p-6">
+      <div class="flex items-center gap-3 flex-wrap">
+        <button id="syncBtn" class="px-5 py-2 rounded-lg border border-slate-300 text-sm font-medium hover:bg-slate-50">자막 상태 맞추기</button>
+        <span class="text-sm text-slate-500">폴더의 자막과 장부를 대조해 <b>기록만</b> 맞춥니다. 자막 파일은 건드리지 않습니다.</span>
+      </div>
+      <div id="syncResult" class="hidden mt-4"></div>
+    </div>
+
     <!-- 채널 목록 -->
     <div class="bg-white rounded-xl border border-slate-200 p-6">
       <div class="flex items-baseline justify-between mb-1 flex-wrap gap-2">
@@ -377,8 +389,9 @@
             <input id="addStudy" type="checkbox" class="w-4 h-4 rounded border-slate-300"> 학습
           </label>
         </span>
-        <input id="addFolder" type="text" placeholder="저장 폴더"
+        <input id="addFolder" type="text" placeholder="저장 폴더" list="schedFolders"
                class="w-44 px-3 py-2.5 rounded-lg border border-slate-300 text-sm">
+        <button id="addPick" class="px-3 py-2.5 rounded-lg border border-slate-300 text-sm hover:bg-slate-50">폴더…</button>
         <button id="addBtn" class="px-5 py-2.5 rounded-lg bg-slate-900 text-white text-sm font-medium hover:bg-slate-700">확인</button>
       </div>
       <div id="addNote" class="hidden mt-3 px-3 py-2 rounded text-xs"></div>

@@ -1344,6 +1344,7 @@ function setMode(mode) {
 
   $('queueMode').classList.toggle('hidden', mode !== 'queue');
   $('findMode').classList.toggle('hidden', mode !== 'find');
+  $('scheduleMode').classList.toggle('hidden', mode !== 'schedule');
   if (collecting) {
     const wantFlow = mode === 'video' ? 'video' : 'channel';
     // 실행·완료 화면은 두 흐름이 함께 쓴다. 지금 그 화면에 있는 작업이 이 탭의
@@ -1362,6 +1363,7 @@ function setMode(mode) {
   highlightTabs(mode);
   if (mode === 'find') loadFindStatus();
   if (mode === 'queue') loadQueuePage();
+  if (mode === 'schedule') openScheduleTab();
 }
 
 // 대기열에서 작업을 열면 화면은 바뀌는데 탭 표시는 그대로라 어디에 있는지
@@ -1640,6 +1642,447 @@ async function openFindPreview(row) {
   } catch (err) {
     showError(err.message);
   }
+}
+
+// --- 예약 수집 탭 ---
+
+// 화면 문구는 여기서 만든다. 서버는 코드 문자열만 준다 — 문구를 고치려고
+// 맥 쪽 코드를 고치는 일이 없게 하기 위해서다.
+const SCHED_DAYS = ['일', '월', '화', '수', '목', '금', '토'];
+const ROLE_LABEL = { news: '뉴스', study: '학습', material: '재료' };
+const FLAG_LABEL = {
+  not_targeted: '이번 회차 대상 아님',
+  orphan_files: '장부에 없는 파일 있음',
+  channel_error: '채널 주소 확인 필요',
+};
+const REASON_LABEL = {
+  NO_SUBTITLES: '자막이 없는 영상',
+  CHANNEL_ERROR: '채널을 열지 못함',
+  RATE_LIMITED: '유튜브가 요청을 막음',
+  TIMEOUT: '응답이 없음',
+  PRIVATE_VIDEO: '비공개 영상',
+  FETCH_FAILED: '자막을 받지 못함',
+};
+// pmset 은 요일을 MTWRFSU 로 쓴다 (launchd 는 0=일요일)
+const PMSET_LETTER = ['U', 'M', 'T', 'W', 'R', 'F', 'S'];
+
+const sched = { days: [], channels: [], folders: [], runTimer: null, lastFolder: '' };
+let toastTimer = null;
+
+function toast(message) {
+  const box = $('toast');
+  box.textContent = message;
+  box.classList.remove('hidden');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => box.classList.add('hidden'), 1800);
+}
+
+function formatDate8(value) {
+  if (!value || String(value).length !== 8) return '—';
+  const s = String(value);
+  return `${s.slice(0, 4)}.${s.slice(4, 6)}.${s.slice(6)}`;
+}
+
+function untilText(iso) {
+  if (!iso) return '';
+  const gap = (new Date(iso) - new Date()) / 1000;
+  if (gap <= 0) return '';
+  const days = Math.floor(gap / 86400);
+  const hours = Math.floor((gap % 86400) / 3600);
+  if (days) return `약 ${days}일 ${hours}시간 뒤`;
+  const mins = Math.floor((gap % 3600) / 60);
+  return hours ? `약 ${hours}시간 ${mins}분 뒤` : `약 ${mins}분 뒤`;
+}
+
+async function loadSchedule() {
+  try {
+    const d = await api('/api/schedule');
+    sched.days = d.schedule.days.slice();
+    $('schedEnabled').checked = d.schedule.enabled;
+    $('schedTime').value = `${String(d.schedule.hour).padStart(2, '0')}:${String(d.schedule.minute).padStart(2, '0')}`;
+    renderDays();
+    renderScheduleBadge(d);
+    renderPmset();
+    renderRun(d.run);
+  } catch (err) {
+    showError(err.message);
+  }
+}
+
+// 예약이 켜졌는지는 launchctl 이 실제로 들고 있는지로 말한다.
+// 설정 파일만 보고 "켜짐"이라 적으면, 등록에 실패한 것을 눈치채지 못한다.
+function renderScheduleBadge(d) {
+  const badge = $('schedBadge');
+  badge.textContent = d.loaded ? '예약 켜짐 (launchd 등록됨)' : '예약 꺼짐';
+  badge.className = 'text-xs px-2 py-1 rounded-full ' + (d.loaded
+    ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500');
+
+  const next = d.next_run && d.loaded
+    ? `다음 실행 ${d.next_run_day}요일 ${d.next_run.slice(11)} · ${untilText(d.next_run)}`
+    : '';
+  $('schedNext').textContent = next;
+
+  if (d.applied && d.applied.output) {
+    $('schedOutput').textContent = d.applied.output;
+    $('schedOutput').classList.remove('hidden');
+  }
+}
+
+function renderDays() {
+  $('schedDays').innerHTML = SCHED_DAYS.map((name, i) => {
+    const on = sched.days.includes(i);
+    return `<button class="sday px-3 py-1.5 rounded-lg border text-sm ${on
+      ? 'bg-slate-900 text-white border-slate-900'
+      : 'border-slate-300 text-slate-600 hover:bg-slate-50'}" data-day="${i}">${name}</button>`;
+  }).join('');
+  document.querySelectorAll('.sday').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const day = Number(btn.dataset.day);
+      sched.days = sched.days.includes(day)
+        ? sched.days.filter((d) => d !== day)
+        : sched.days.concat(day).sort();
+      renderDays();
+      renderPmset();
+    });
+  });
+}
+
+function renderPmset() {
+  const letters = sched.days.map((d) => PMSET_LETTER[d]).join('') || 'WS';
+  $('pmsetCmd').textContent =
+    `sudo pmset repeat wakeorpoweron ${letters} ${$('schedTime').value || '06:00'}:00`;
+}
+
+$('schedTime').addEventListener('input', renderPmset);
+
+$('pmsetCopy').addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText($('pmsetCmd').textContent);
+    toast('명령을 복사했습니다');
+  } catch (err) {
+    toast('복사하지 못했습니다 — 직접 선택해 주세요');
+  }
+});
+
+$('schedSave').addEventListener('click', async () => {
+  const [hour, minute] = ($('schedTime').value || '06:00').split(':').map(Number);
+  $('schedSave').disabled = true;
+  try {
+    const d = await api('/api/schedule', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        enabled: $('schedEnabled').checked, days: sched.days, hour, minute,
+      }),
+    });
+    renderScheduleBadge(d);
+    if (d.applied && !d.applied.ok) showError('launchd 반영에 실패했습니다. 아래 출력을 확인하세요.');
+    else toast('예약을 저장했습니다');
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    $('schedSave').disabled = false;
+  }
+});
+
+// --- 채널 목록 ---
+
+async function loadScheduleChannels() {
+  try {
+    const d = await api('/api/schedule/channels');
+    sched.channels = d.channels;
+    sched.folders = d.folders || [];
+    $('schedCount').textContent = `${formatCount(d.channels.length)}개`;
+    const problems = $('schedProblems');
+    if (d.problems && d.problems.length) {
+      problems.innerHTML = '채널 목록 형식이 맞지 않습니다<br>' +
+        d.problems.map(escapeHtml).join('<br>');
+      problems.classList.remove('hidden');
+    } else {
+      problems.classList.add('hidden');
+    }
+    renderChannels();
+  } catch (err) {
+    showError(err.message);
+  }
+}
+
+function renderChannels() {
+  const folders = sched.folders.map((f) => `<option value="${escapeHtml(f)}">`).join('');
+  $('schedChannels').innerHTML = `<datalist id="schedFolders">${folders}</datalist>` +
+    sched.channels.map(channelRow).join('');
+}
+
+function channelRow(row) {
+  const warn = row.flags.includes('channel_error');
+  const flags = row.flags.map((f) => `<span class="text-xs px-2 py-0.5 rounded ${
+    f === 'channel_error' ? 'bg-red-50 text-red-700' : 'bg-amber-50 text-amber-800'
+  }">${FLAG_LABEL[f] || f}</span>`).join(' ');
+  const files = row.total_files == null ? '폴더 없음'
+    : `${formatCount(row.total_files)}개 보유`;
+  const last = row.last_content_at
+    ? `마지막 ${formatDate8(row.last_content_at)} · ${formatCount(row.last_count)}편`
+    : '받은 적 없음';
+  const roles = Object.keys(ROLE_LABEL).map((key) =>
+    `<option value="${key}"${row.role === key ? ' selected' : ''}>${ROLE_LABEL[key]}</option>`).join('');
+
+  return `<div class="py-3 flex items-center gap-3 flex-wrap ${warn ? 'bg-red-50/40' : ''}" data-name="${escapeHtml(row.name)}">
+    <span class="w-8 h-8 rounded-full bg-slate-200 text-slate-600 grid place-items-center text-sm font-semibold shrink-0">${escapeHtml(row.name.slice(0, 1))}</span>
+    <div class="min-w-[12rem] flex-1">
+      <div class="text-sm font-medium">${escapeHtml(row.name)}</div>
+      <div class="text-xs text-slate-400">${escapeHtml(row.handle || row.url)}</div>
+    </div>
+    <div class="text-xs text-slate-500 tabular-nums min-w-[11rem]">
+      <div>${last}</div>
+      <div>${files}${row.last_failed ? ` · 실패 ${formatCount(row.last_failed)}건` : ''}</div>
+    </div>
+    <div class="flex items-center gap-2 flex-wrap">
+      ${flags}
+      <label class="flex items-center gap-1 text-xs text-slate-500">
+        <input type="checkbox" class="chActive w-4 h-4 rounded border-slate-300"${row.active ? ' checked' : ''}> 켬
+      </label>
+      <select class="chRole px-2 py-1.5 rounded border border-slate-300 text-sm">${roles}</select>
+      <input class="chFolder w-36 px-2 py-1.5 rounded border border-slate-300 text-sm"
+             list="schedFolders" value="${escapeHtml(row.category_folder || '')}" placeholder="저장 폴더">
+      <button class="chDelete text-xs text-slate-400 hover:text-red-600 px-1">삭제</button>
+    </div>
+  </div>`;
+}
+
+function rowName(el) {
+  return el.closest('[data-name]').dataset.name;
+}
+
+async function patchChannel(name, patch, label) {
+  try {
+    await api('/api/schedule/channels', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ name }, patch)),
+    });
+    toast(`${name} — ${label}`);
+  } catch (err) {
+    showError(err.message);
+    loadScheduleChannels();     // 저장이 안 됐으면 화면을 사실에 맞춘다
+  }
+}
+
+// 줄이 다시 그려져도 계속 동작하도록 컨테이너에서 한 번만 듣는다
+$('schedChannels').addEventListener('change', (e) => {
+  const el = e.target;
+  if (el.classList.contains('chActive')) {
+    patchChannel(rowName(el), { active: el.checked }, el.checked ? '켰습니다' : '껐습니다');
+  } else if (el.classList.contains('chRole')) {
+    patchChannel(rowName(el), { role: el.value }, `${ROLE_LABEL[el.value]}로 바꿨습니다`);
+  } else if (el.classList.contains('chFolder')) {
+    sched.lastFolder = el.value.trim();
+    patchChannel(rowName(el), { category_folder: el.value.trim() }, '저장 폴더를 바꿨습니다');
+  }
+});
+
+$('schedChannels').addEventListener('click', async (e) => {
+  if (!e.target.classList.contains('chDelete')) return;
+  const name = rowName(e.target);
+  if (!confirm(`${name} 을(를) 목록에서 뺍니다.\n받아둔 자막과 기록은 그대로 남습니다.`)) return;
+  try {
+    await api('/api/schedule/channels/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    toast(`${name} 을(를) 목록에서 뺐습니다`);
+    loadScheduleChannels();
+  } catch (err) {
+    showError(err.message);
+  }
+});
+
+// --- 채널 추가 ---
+
+function addNote(message, tone) {
+  const box = $('addNote');
+  box.textContent = message;
+  box.className = 'mt-3 px-3 py-2 rounded text-xs ' + tone;
+  box.classList.remove('hidden');
+}
+
+async function addChannel(url) {
+  addNote('채널을 확인하는 중…', 'bg-slate-50 text-slate-600');
+  try {
+    const d = await api('/api/schedule/channels', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url,
+        role: $('addRole').value,
+        category_folder: $('addFolder').value.trim() || sched.lastFolder,
+      }),
+    });
+    $('addQuery').value = '';
+    $('addCandidates').classList.add('hidden');
+    addNote(`${d.name} 을(를) 추가했습니다.`, 'bg-emerald-50 text-emerald-800');
+    loadScheduleChannels();
+  } catch (err) {
+    // 주소가 틀린 채널이 목록에 들어가면 예약 수집 때 조용히 실패한다.
+    // 그래서 확인에 실패하면 추가하지 않고 이유만 보여준다.
+    addNote(err.message, 'bg-red-50 text-red-700');
+  }
+}
+
+// @핸들·URL·채널 ID 는 곧장 해석한다. 이름으로 검색하면 엉뚱한 채널이 후보로
+// 뜨는데, 핸들을 이름처럼 검색하면 "없는 채널"이 아니라 남의 채널이 뜬다.
+function looksLikeChannelAddress(text) {
+  return text.startsWith('@') || looksLikeUrl(text) || /^UC[A-Za-z0-9_-]{22}$/.test(text);
+}
+
+async function findChannelToAdd() {
+  const query = $('addQuery').value.trim();
+  if (!query) return;
+  $('addCandidates').classList.add('hidden');
+  if (looksLikeChannelAddress(query)) {
+    await addChannel(query);
+    return;
+  }
+  addNote('찾는 중…', 'bg-slate-50 text-slate-600');
+  try {
+    const d = await api('/api/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query }),
+    });
+    if (d.is_url || (d.candidates || []).length === 1) {
+      await addChannel((d.candidates[0] || {}).url || query);
+      return;
+    }
+    if (!(d.candidates || []).length) {
+      addNote('후보를 찾지 못했습니다. 핸들이나 URL을 넣어보세요.', 'bg-red-50 text-red-700');
+      return;
+    }
+    $('addNote').classList.add('hidden');
+    $('addCandidates').innerHTML = d.candidates.map((c) => `
+      <button class="addPick w-full text-left px-3 py-2 hover:bg-slate-50 flex items-center gap-3"
+              data-url="${escapeHtml(c.url)}">
+        <span class="w-7 h-7 rounded-full bg-slate-200 text-slate-600 grid place-items-center text-xs font-semibold shrink-0">${escapeHtml((c.name || '?').slice(0, 1))}</span>
+        <span class="flex-1 min-w-0">
+          <span class="block text-sm truncate">${escapeHtml(c.name)}</span>
+          <span class="block text-xs text-slate-400 truncate">${escapeHtml(c.url)}</span>
+        </span>
+      </button>`).join('');
+    $('addCandidates').classList.remove('hidden');
+  } catch (err) {
+    addNote(err.message, 'bg-red-50 text-red-700');
+  }
+}
+
+$('addBtn').addEventListener('click', findChannelToAdd);
+$('addQuery').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') findChannelToAdd();
+});
+$('addCandidates').addEventListener('click', (e) => {
+  const btn = e.target.closest('.addPick');
+  if (btn) addChannel(btn.dataset.url);
+});
+
+// --- 지금 한 번 수집 ---
+
+function renderRun(run) {
+  if (!run) return;
+  const busy = run.running;
+  $('runNow').disabled = busy;
+  $('runNow').className = 'px-5 py-2 rounded-lg text-sm font-medium ' + (busy
+    ? 'bg-slate-200 text-slate-400'
+    : 'bg-slate-900 text-white hover:bg-slate-700');
+  $('runState').textContent = busy
+    ? `${run.index}/${run.total} 채널 · ${run.channel || '준비 중'} · 지금까지 ${formatCount(run.collected)}편`
+    : (run.finished_at
+      ? `마지막 실행 — 수집 ${formatCount(run.collected)}편${run.failed ? ` · 실패 ${formatCount(run.failed)}건` : ''}`
+      : '');
+
+  const log = $('runLog');
+  if (run.logs && run.logs.length) {
+    log.innerHTML = run.logs.map((line) => `<div>${escapeHtml(line)}</div>`).join('');
+    log.classList.remove('hidden');
+    log.scrollTop = log.scrollHeight;
+  }
+  if (run.error) showError(run.error);
+
+  if (busy && !sched.runTimer) {
+    sched.runTimer = setInterval(pollRun, 2000);
+  } else if (!busy && sched.runTimer) {
+    clearInterval(sched.runTimer);
+    sched.runTimer = null;
+    loadScheduleChannels();
+    loadHistory();
+  }
+}
+
+async function pollRun() {
+  try {
+    const d = await api('/api/schedule');
+    renderRun(d.run);
+  } catch (err) { /* 잠깐 끊긴 것은 다음 차례에 다시 본다 */ }
+}
+
+$('runNow').addEventListener('click', async () => {
+  const limit = Number($('runLimit').value) || 0;
+  try {
+    const d = await api('/api/schedule/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ limit }),
+    });
+    toast(`${d.total}개 채널을 돌기 시작했습니다`);
+    pollRun();
+  } catch (err) {
+    showError(err.message);
+  }
+});
+
+// --- 지난 실행 ---
+
+async function loadHistory() {
+  try {
+    const d = await api('/api/schedule/history?limit=10');
+    if (!d.runs.length) {
+      $('schedHistory').innerHTML = '<p class="text-sm text-slate-400">아직 실행 기록이 없습니다.</p>';
+      return;
+    }
+    $('schedHistory').innerHTML = d.runs.map((run) => {
+      const when = (run.ran_at || '').replace('T', ' ').slice(0, 16);
+      const reasons = run.reasons.map((r) => `
+        <div class="text-xs text-slate-500 pl-3">· ${escapeHtml(REASON_LABEL[r.reason] || r.reason)}
+          ${formatCount(r.count)}건 <span class="text-slate-400">${escapeHtml(r.channels.slice(0, 3).join(', '))}</span></div>`).join('');
+      return `<div class="px-3 py-2 rounded-lg border border-slate-200">
+        <div class="flex items-baseline gap-2 flex-wrap text-sm">
+          <span class="tabular-nums text-slate-600">${escapeHtml(when)}</span>
+          <span class="text-slate-400 text-xs">${escapeHtml(run.week)}</span>
+          <span class="flex-1"></span>
+          <span class="tabular-nums">수집 <b>${formatCount(run.collected)}</b>편</span>
+          ${run.failed ? `<span class="tabular-nums text-red-600">실패 ${formatCount(run.failed)}건</span>` : ''}
+        </div>${reasons}</div>`;
+    }).join('');
+  } catch (err) {
+    showError(err.message);
+  }
+}
+
+$('logBtn').addEventListener('click', async () => {
+  try {
+    const d = await api('/api/schedule/log?lines=200');
+    $('modalTitle').textContent = '수집 로그 — ' + d.path;
+    $('modalText').textContent = d.text || '(비어 있습니다)';
+    $('modalDl').onclick = () => saveBlob(
+      new Blob([d.text], { type: 'text/plain;charset=utf-8' }), 'collect.log');
+    $('modal').classList.remove('hidden');
+  } catch (err) {
+    showError(err.message);
+  }
+});
+
+function openScheduleTab() {
+  loadSchedule();
+  loadScheduleChannels();
+  loadHistory();
 }
 
 setMode('collect');

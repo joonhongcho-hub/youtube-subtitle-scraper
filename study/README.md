@@ -11,12 +11,19 @@
 
 | 파일 | 방향 | 누가 쓰나 |
 |---|---|---|
-| `config/channels.json` | 페이지 → 맥 | **코워크가 쓴다.** 맥 쪽 코드는 읽기만 |
+| `output/_설정/channels.json` | 페이지 → 맥 | **코워크와 예약 탭이 쓴다.** 수집은 읽기만 |
+| `output/_설정/schedule.json` | 화면 → 맥 | **예약 탭이 쓴다.** 요일·시각·on/off |
 | `data/status.json` | 맥 → 페이지 | **맥이 쓴다.** 코워크가 읽어 페이지에 올린다 |
+
+채널 목록은 자막이 쌓이는 `output/` 옆으로 옮겼다 — 폴더 하나만 열면 무엇을 모으고
+있고 무엇이 모였는지가 한자리에 있다. 읽는 순서는 `--config-dir` → `output/_설정/`
+→ 옛 자리인 `study/config/` 이고, 어느 파일을 읽었는지 실행할 때 한 줄 찍는다.
+`settings.json` 은 `output_root` 경로 해석이 엮여 있어 옮기지 않았다.
 
 `channels.json`이 형식에 어긋나면 `collect.py`는 무엇이 잘못됐는지 찍고 **수집을
 시작하지 않는다.** 기본값으로 얼버무리고 몇 시간을 돌리는 것보다 낫기 때문이다.
-`role`은 `news` 또는 `material`, `state`는 `confirmed` / `pending` / `failed`,
+`role`은 `news`(브리핑에 들어감) · `study`(받아두되 브리핑에는 안 들어감) ·
+`material`(쌓아만 둠, 수집 대상 아님) 셋이고, `state`는 `confirmed` / `pending` / `failed`,
 `url`은 반드시 링크여야 한다. 채널명만 적으면 `resolve_channel`이 사람에게 번호를
 물어보는데 예약 실행에는 답할 사람이 없다.
 

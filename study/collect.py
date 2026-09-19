@@ -1,7 +1,8 @@
-"""일요일 수집 — 뉴스 채널의 신규 영상 자막만 받아온다.
+"""예약 수집 — 뉴스·학습 채널의 신규 영상 자막만 받아온다.
 
-코워크가 일주일에 한 번 이 스크립트를 부른다. 판단은 하지 않는다.
-자막을 파일로 떨구고, 무엇을 받았는지 JSON으로 남기는 것까지가 전부다.
+launchd 가 정해둔 요일·시각에 이 스크립트를 부른다(웹의 예약 탭이 그 일정을
+관리한다). 판단은 하지 않는다. 자막을 파일로 떨구고, 무엇을 받았는지 JSON으로
+남기는 것까지가 전부다.
 
     python study/collect.py [--dry-run] [--only 채널명] [--limit N]
                             [--config-dir 폴더]
@@ -27,6 +28,10 @@ import subtitle     # noqa: E402
 
 # 설정 폴더는 --config-dir 로 바꿀 수 있다. 원본 설정을 건드리지 않고 시험하려고 둔다.
 DEFAULT_CONFIG_DIR = os.path.join(ROOT, "config")
+# 채널 목록은 자막이 쌓이는 곳 옆으로 옮겼다 — 폴더 하나만 열면 "무엇을 모으고
+# 있고 무엇이 모였는지"가 한자리에 있다. 옛 자리도 계속 읽어 조용히 깨지지 않게 한다.
+SHARED_CONFIG_DIR = os.path.join(APP, "output", "_설정")
+SCHEDULE_PATH = os.path.join(SHARED_CONFIG_DIR, "schedule.json")
 DATA_DIR = os.path.join(ROOT, "data")
 COLLECTED_DIR = os.path.join(DATA_DIR, "collected")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
@@ -37,11 +42,30 @@ STATUS_PATH = os.path.join(DATA_DIR, "status.json")
 SCHEMA = 1
 
 # channels.json 에 올 수 있는 값. 여기 없는 값이 오면 수집을 시작하지 않는다.
-ROLES = ("news", "material")
+#   news     브리핑에 들어간다
+#   study    받아두되 브리핑에는 안 들어간다
+#   material 나중에 찾아 쓰려고 쌓아만 둔다 — 예약 수집 대상이 아니다
+ROLES = ("news", "study", "material")
+COLLECTED_ROLES = ("news", "study")
 STATES = ("confirmed", "pending", "failed")
 
 # 기준일이 아예 없는 채널을 처음 돌릴 때 얼마나 거슬러 올라갈지
 FIRST_RUN_DAYS = 14
+
+
+def channels_path(config_dir=None):
+    """채널 목록을 어디서 읽을지 정한다.
+
+    --config-dir 이 주어지면 그 폴더가 최우선이다 (시험용). 그 다음이 새 자리인
+    output/_설정, 마지막이 옛 자리인 study/config 다. 옛 자리를 계속 보는 것은
+    설정을 옮긴 뒤에도 예약 실행이 멈추지 않게 하기 위해서다.
+    """
+    if config_dir:
+        return os.path.join(config_dir, "channels.json")
+    shared = os.path.join(SHARED_CONFIG_DIR, "channels.json")
+    if os.path.exists(shared):
+        return shared
+    return os.path.join(DEFAULT_CONFIG_DIR, "channels.json")
 
 
 def resolve_root(settings):
@@ -138,19 +162,69 @@ def week_total(week, doc):
             "runs": len(runs)}
 
 
-def validate_channels(config):
-    """channels.json 형식을 확인한다. 어긋나면 수집을 시작하지 않고 멈춘다.
+def remember_run(state, name, today, collected, advance_baseline=True):
+    """이 채널을 방금 돌았다는 사실을 장부에 적는다.
 
-    코워크가 덮어쓰는 파일이라 형식이 깨질 수 있다. 기본값으로 얼버무리고
-    진행하면 잘못된 목록으로 몇 시간을 돌리게 된다. 그게 가장 나쁘다.
+    last_success 는 수집 범위를 정하는 기준일이다. 편수 제한을 걸고 돌린 실행은
+    앞의 N편만 받고 나머지를 남겨두므로 기준일을 옮기면 안 된다 — 옮기면 남은
+    영상이 다음 실행의 후보에서 빠져 영영 들어오지 않는다.
     """
-    check_schema(config, "channels.json")
+    known = dict(state.setdefault("channels", {}).get(name, {}))
+    if advance_baseline:
+        known["last_success"] = today
+    known["last_run"] = datetime.datetime.now().isoformat(timespec="seconds")
+    if collected > 0:
+        # 1편이라도 받았을 때만 옮긴다. 0편 실행이 지난 편수를 지우면
+        # 화면에는 "마지막 수집 0편"이라는 거짓말이 뜬다.
+        known["last_content_at"] = today
+        known["last_content_count"] = collected
+    state["channels"][name] = known
+    return known
+
+
+def append_run(channels, failures, missing, ran_at, week=None):
+    """이번 실행을 주차 파일 뒤에 덧붙이고 (파일 경로, 주간 누계)를 돌려준다."""
+    week = week or week_id()
+    os.makedirs(COLLECTED_DIR, exist_ok=True)
+    path = os.path.join(COLLECTED_DIR, "{}.json".format(week))
+    doc = load_week(path, week)
+    # 이번 실행은 이번에 받은 것만 담는다. 실행끼리 파일이 겹치지 않는다.
+    doc["runs"].append({
+        "ran_at": ran_at,
+        "channels": channels,
+        "failures": failures,
+        "missing_files": missing,
+    })
+    storage.save_json(path, doc)
+    return path, week_total(week, doc)
+
+
+def count_records(folder):
+    """장부(processed_ids.json)에 성공으로 적힌 자막 수. 장부가 없으면 0."""
+    path = os.path.join(storage.state_dir(folder), "processed_ids.json")
+    records = storage.load_json(path, {})
+    if not isinstance(records, dict):
+        return 0
+    return sum(1 for r in records.values()
+               if isinstance(r, dict) and r.get("status") == subtitle.SUCCESS)
+
+
+def channel_problems(config):
+    """channels.json 형식을 살펴 어긋난 곳을 모두 적어 돌려준다.
+
+    멈추지 않고 목록만 돌려주는 것은 화면(예약 탭)도 같은 검사를 써야 하기
+    때문이다. 서버 안에서 sys.exit 을 부를 수는 없다.
+    """
+    problems, seen = [], {}
+    if config.get("schema") != SCHEMA:
+        problems.append("schema 가 {} 이어야 합니다 (지금 {!r})".format(
+            SCHEMA, config.get("schema")))
 
     entries = config.get("channels")
     if not isinstance(entries, list):
-        die("channels.json 에 channels 배열이 없습니다.")
+        problems.append("channels 배열이 없습니다")
+        return problems
 
-    problems, seen = [], {}
     for i, entry in enumerate(entries):
         where = "channels[{}]".format(i)
         if not isinstance(entry, dict):
@@ -188,6 +262,16 @@ def validate_channels(config):
             problems.append("{}: state 는 {} 중 하나여야 합니다 (지금 {!r})".format(
                 where, " / ".join(STATES), entry.get("state")))
 
+    return problems
+
+
+def validate_channels(config):
+    """형식이 어긋나면 수집을 시작하지 않고 멈춘다.
+
+    코워크가 덮어쓰는 파일이라 형식이 깨질 수 있다. 기본값으로 얼버무리고
+    진행하면 잘못된 목록으로 몇 시간을 돌리게 된다. 그게 가장 나쁘다.
+    """
+    problems = channel_problems(config)
     if not problems:
         return
     print("[중단] channels.json 형식이 맞지 않습니다 ({}건):".format(len(problems)),
@@ -198,11 +282,14 @@ def validate_channels(config):
     sys.exit(1)
 
 
-def news_channels(config):
-    """수집 대상만 골라낸다 — 확인된 뉴스 채널 중 켜져 있는 것."""
+def collect_targets(config):
+    """수집 대상만 골라낸다 — 확인된 뉴스·학습 채널 중 켜져 있는 것.
+
+    재료(material)는 쌓아만 두는 채널이라 예약 수집이 건드리지 않는다.
+    """
     out = []
     for entry in config.get("channels", []):
-        if entry.get("role") != "news":
+        if entry.get("role") not in COLLECTED_ROLES:
             continue
         if not entry.get("active", True):
             continue
@@ -357,25 +444,33 @@ def build_status(config, settings, state, summaries, failures, targets,
     한국어를 넣으면 문구 하나 고치려고 맥 코드를 고치게 된다.
     """
     done = {s["name"]: s for s in summaries}
-    failed = {}
+    # 채널을 못 연 실패와 영상에 자막이 없는 실패는 사람이 할 일이 완전히 다르다.
+    # 주소를 고쳐야 하는 쪽과, 그냥 그런 영상인 쪽을 섞지 않는다.
+    video_failed, channel_failed = {}, {}
     for item in failures:
-        failed[item["channel"]] = failed.get(item["channel"], 0) + 1
+        bucket = (channel_failed if item.get("reason") == "CHANNEL_ERROR"
+                  else video_failed)
+        bucket[item["channel"]] = bucket.get(item["channel"], 0) + 1
 
     channels = []
     for entry in config["channels"]:
         name = entry["name"]
         summary = done.get(name)
-        total = count_txt(status_folder(settings, entry, summary))
+        folder = status_folder(settings, entry, summary)
+        total = count_txt(folder)
+        recorded = count_records(folder)
         known = state["channels"].get(name, {})
         last_at = known.get("last_content_at")
 
         flags = []
         if name not in targets:
             flags.append("not_targeted")
-        if last_at is None and total:
-            # 받은 기록은 없는데 자막이 있다. 다른 경로로 받았다는 신호다.
-            # 화면이 "한 번도 수집 안 함 / 19편 보유"를 그대로 그리지 않게 한다.
+        if total and total > recorded:
+            # 폴더의 자막이 장부보다 많다. 다른 경로로 받았거나 장부를 잃은 것이라
+            # 이어받기가 어긋난다. 고치지는 않고 사람이 보게만 한다.
             flags.append("orphan_files")
+        if channel_failed.get(name):
+            flags.append("channel_error")
 
         channels.append({
             "name": name,
@@ -388,7 +483,10 @@ def build_status(config, settings, state, summaries, failures, targets,
             "this_run": summary["collected"] if summary else 0,
             # 폴더가 없으면 null. 0(폴더는 있는데 빔)과 다른 상태다.
             "total_files": total,
-            "last_failed": failed.get(name, 0),
+            # 장부에 적힌 수 — total_files 와 다르면 위 orphan_files 가 선다
+            "recorded_files": recorded,
+            "last_failed": video_failed.get(name, 0),
+            "channel_failed": channel_failed.get(name, 0),
             "flags": flags,
         })
 
@@ -418,9 +516,13 @@ def main(argv=None):
                         help="설정을 읽을 폴더 (기본: study/config)")
     args = parser.parse_args(argv)
 
-    config_dir = args.config_dir or DEFAULT_CONFIG_DIR
-    settings = read_json(os.path.join(config_dir, "settings.json"), "settings.json")
-    config = read_json(os.path.join(config_dir, "channels.json"), "channels.json")
+    settings_dir = args.config_dir or DEFAULT_CONFIG_DIR
+    settings = read_json(os.path.join(settings_dir, "settings.json"), "settings.json")
+    chan_path = channels_path(args.config_dir)
+    # 설정이 두 자리에 있을 수 있다. 어느 쪽을 읽었는지 남겨야 "고쳤는데 왜
+    # 그대로냐"를 몇 시간 뒤에 알아채지 않는다.
+    log("info", "채널 목록: {}".format(chan_path))
+    config = read_json(chan_path, "channels.json")
     # 네트워크를 건드리기 전에 목록부터 확인한다
     validate_channels(config)
     if not settings.get("output_root"):
@@ -432,7 +534,7 @@ def main(argv=None):
         state = read_json(STATE_PATH, "state.json")
     state.setdefault("channels", {})
 
-    targets = news_channels(config)
+    targets = collect_targets(config)
     if args.only:
         targets = [t for t in targets if t["name"] == args.only]
     if not targets:
@@ -467,34 +569,14 @@ def main(argv=None):
         channels.append(summary)
         if ok:
             # 성공한 채널만 기준일을 옮긴다. 실패한 채널은 다음에 다시 시도된다.
-            known = dict(state["channels"].get(entry["name"], {}))
-            # last_success 는 --since 기준일이다. 뜻을 바꾸지 않는다.
-            known["last_success"] = today
-            known["last_run"] = datetime.datetime.now().isoformat(timespec="seconds")
-            if summary["collected"] > 0:
-                # 1편이라도 받았을 때만 옮긴다. 0편 실행이 지난 편수를 지우면
-                # 화면에는 "마지막 수집 0편"이라는 거짓말이 뜬다.
-                known["last_content_at"] = today
-                known["last_content_count"] = summary["collected"]
-            state["channels"][entry["name"]] = known
+            # 편수 제한을 걸었으면 나머지가 남아 있으므로 기준일을 두고 간다.
+            remember_run(state, entry["name"], today, summary["collected"],
+                         advance_baseline=not args.limit)
 
     week = week_id()
     ran_at = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
-    os.makedirs(COLLECTED_DIR, exist_ok=True)
-    out_path = os.path.join(COLLECTED_DIR, "{}.json".format(week))
-
-    # 이번 실행은 이번에 받은 것만 담아 뒤에 덧붙인다. 실행끼리 파일이 겹치지 않는다.
-    doc = load_week(out_path, week)
-    doc["runs"].append({
-        "ran_at": ran_at,
-        "channels": channels,
-        "failures": failures,
-        "missing_files": missing,
-    })
-    storage.save_json(out_path, doc)
+    out_path, totals = append_run(channels, failures, missing, ran_at, week)
     storage.save_json(STATE_PATH, state)
-
-    totals = week_total(week, doc)
     status = build_status(config, settings, state, channels, failures,
                           {t["name"] for t in targets}, week, ran_at,
                           missing, totals)

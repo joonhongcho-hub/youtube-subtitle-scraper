@@ -22,6 +22,7 @@ import channel
 import engine
 import jobs
 import report
+import scheduler
 import search
 import storage
 import subtitle
@@ -1319,6 +1320,238 @@ def api_search_export(req: ExportRequest):
     return Response(content=text.encode("utf-8"),
                     media_type="text/plain; charset=utf-8",
                     headers=attachment_headers("자막모음.txt"))
+
+
+
+# --- 예약 수집 API ---
+
+# 예약 수집은 채널 목록(output/_설정/channels.json)과 예약 설정(schedule.json)을
+# 화면에서 다루게 한 것이다. 실제 수집 규칙과 장부는 study/collect.py 가 갖고,
+# 여기서는 읽기·쓰기와 launchd 배선만 한다. 자세한 이유는 scheduler.py 참고.
+
+
+class ScheduleRequest(BaseModel):
+    enabled: bool = True
+    days: list = []
+    hour: int = 6
+    minute: int = 0
+
+
+class ChannelAddRequest(BaseModel):
+    url: str = ""
+    role: str = "news"
+    category_folder: str = ""
+
+
+class ChannelPatchRequest(BaseModel):
+    # 채널 이름에 한글·공백·쉼표가 들어간다. 경로에 싣지 않고 본문으로 받는다.
+    name: str
+    active: bool = None
+    role: str = None
+    category_folder: str = None
+
+
+class ChannelNameRequest(BaseModel):
+    name: str
+
+
+def schedule_dir_finder():
+    """예약 수집이 쓸 채널 폴더를 찾는 함수 — 이미 옮겨둔 폴더를 그대로 쓴다."""
+    return lambda name: find_channel_dir(storage.sanitize_filename(name))
+
+
+def schedule_payload(applied=None):
+    schedule = scheduler.load_schedule()
+    when = scheduler.next_run(schedule)
+    payload = {
+        "schedule": schedule,
+        # 파일의 enabled 가 아니라 launchctl 이 실제로 들고 있는지를 본다
+        "loaded": scheduler.launchd_loaded(),
+        "next_run": when.isoformat(timespec="minutes") if when else None,
+        "next_run_day": scheduler.DAY_NAMES[(when.weekday() + 1) % 7] if when else None,
+        "label": scheduler.LABEL,
+        "plist": scheduler.PLIST_DST,
+        "log_path": scheduler.LOG_PATH,
+        "run": scheduler.run_state(),
+    }
+    if applied is not None:
+        payload["applied"] = applied
+    return payload
+
+
+@app.get("/api/schedule")
+def api_schedule():
+    return schedule_payload()
+
+
+@app.post("/api/schedule")
+def api_schedule_save(req: ScheduleRequest):
+    days = sorted({int(d) for d in req.days if 0 <= int(d) <= 6})
+    if req.enabled and not days:
+        raise HTTPException(400, "요일을 하나 이상 고르세요.")
+
+    schedule = scheduler.load_schedule()
+    schedule.update({"enabled": req.enabled, "days": days,
+                     "hour": req.hour, "minute": req.minute})
+    saved = scheduler.save_schedule(schedule)
+    applied = scheduler.apply_schedule(saved)
+    return schedule_payload(applied)
+
+
+@app.get("/api/schedule/channels")
+def api_schedule_channels():
+    return scheduler.channel_rows(schedule_dir_finder())
+
+
+# 유튜브 채널 ID는 UC 로 시작하는 24자다
+CHANNEL_ID_PATTERN = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
+
+
+def as_channel_url(value):
+    """@핸들·채널 ID·URL 을 채널 URL 하나로 맞춘다. 채널명이면 None.
+
+    channel.resolve_channel 은 URL 이 아니면 사람에게 번호를 물어본다(stdin).
+    서버에는 답할 사람이 없으므로 URL 이 아닌 값은 여기서 걸러낸다.
+    """
+    value = (value or "").strip()
+    if not value:
+        return None
+    if channel._is_url(value):
+        return value
+    if value.startswith("@"):
+        return "https://www.youtube.com/{}".format(value)
+    if CHANNEL_ID_PATTERN.match(value):
+        return "https://www.youtube.com/channel/{}".format(value)
+    return None
+
+
+def friendly_channel_error(exc):
+    """yt-dlp 가 뱉는 재시도 경고를 걷어내고 사람이 읽을 한 줄로 만든다."""
+    text = str(exc)
+    if "404" in text or "Not Found" in text:
+        return "그 주소에는 채널이 없습니다. 핸들이나 URL을 다시 확인해 주세요."
+    lines = [line for line in text.splitlines()
+             if line.strip() and not line.startswith("WARNING")]
+    return "채널을 찾지 못했습니다: {}".format((lines[-1] if lines else text)[:200])
+
+
+@app.post("/api/schedule/channels")
+def api_schedule_channel_add(req: ChannelAddRequest):
+    """해석에 성공한 채널만 목록에 넣는다.
+
+    주소가 틀린 채널이 들어가면 예약 수집이 돌 때 조용히 실패하고, 그 사실은
+    다음 주에야 눈에 띈다. 들어오는 자리에서 막는다.
+    """
+    if req.role not in scheduler.collect.ROLES:
+        raise HTTPException(400, "역할은 뉴스·학습·재료 중 하나여야 합니다.")
+    url = as_channel_url(req.url)
+    if not url:
+        raise HTTPException(400,
+                            "@핸들·채널 URL·채널 ID 로 넣어주세요. "
+                            "채널명으로 찾으려면 검색 결과에서 고르세요.")
+    try:
+        resolved = channel.resolve_channel(url)
+        meta = channel.fetch_channel_meta(resolved["url"])
+    except (RuntimeError, SystemExit) as exc:
+        raise HTTPException(400, friendly_channel_error(exc))
+
+    name = (meta.get("name") or resolved.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "채널 이름을 읽지 못했습니다.")
+
+    _, config, problems = scheduler.load_channels()
+    if problems:
+        raise HTTPException(400, "채널 목록을 먼저 고쳐야 합니다: {}".format(
+            " / ".join(problems[:3])))
+    if any(c.get("name") == name for c in config.get("channels", [])):
+        raise HTTPException(400, "이미 목록에 있는 채널입니다: {}".format(name))
+
+    config.setdefault("channels", []).append({
+        "name": name,
+        "url": meta.get("url") or resolved["url"],
+        "role": req.role,
+        "active": True,
+        "category_folder": req.category_folder or "",
+        "state": "confirmed",
+    })
+    try:
+        scheduler.save_channels(config)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True, "name": name,
+            "subscribers": meta.get("subscribers")}
+
+
+@app.patch("/api/schedule/channels")
+def api_schedule_channel_patch(req: ChannelPatchRequest):
+    _, config, problems = scheduler.load_channels()
+    if problems:
+        raise HTTPException(400, "채널 목록을 먼저 고쳐야 합니다: {}".format(
+            " / ".join(problems[:3])))
+
+    target = next((c for c in config.get("channels", [])
+                   if c.get("name") == req.name), None)
+    if target is None:
+        raise HTTPException(404, "목록에 없는 채널입니다: {}".format(req.name))
+
+    if req.active is not None:
+        target["active"] = bool(req.active)
+    if req.role is not None:
+        if req.role not in scheduler.collect.ROLES:
+            raise HTTPException(400, "역할은 뉴스·학습·재료 중 하나여야 합니다.")
+        target["role"] = req.role
+    if req.category_folder is not None:
+        target["category_folder"] = req.category_folder.strip()
+
+    try:
+        scheduler.save_channels(config)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True}
+
+
+@app.post("/api/schedule/channels/delete")
+def api_schedule_channel_delete(req: ChannelNameRequest):
+    """목록에서만 뺀다. 받아둔 자막과 기록은 그대로 둔다."""
+    _, config, _ = scheduler.load_channels()
+    rest = [c for c in config.get("channels", []) if c.get("name") != req.name]
+    if len(rest) == len(config.get("channels", [])):
+        raise HTTPException(404, "목록에 없는 채널입니다: {}".format(req.name))
+    config["channels"] = rest
+    try:
+        scheduler.save_channels(config)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True}
+
+
+@app.post("/api/schedule/run")
+def api_schedule_run(req: dict = None):
+    """지금 한 번 수집 — 채널마다 기존 작업 큐에 넣는다."""
+    limit = 0
+    if isinstance(req, dict):
+        try:
+            limit = int(req.get("limit") or 0)
+        except (TypeError, ValueError):
+            limit = 0
+    try:
+        started = scheduler.start_run(limit or None, enqueue_or_start,
+                                      schedule_dir_finder())
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True, "total": started["total"], "limit": limit}
+
+
+@app.get("/api/schedule/history")
+def api_schedule_history(limit: int = Query(10, ge=1, le=50)):
+    return {"runs": scheduler.history(limit)}
+
+
+@app.get("/api/schedule/log")
+def api_schedule_log(lines: int = Query(200, ge=10, le=2000)):
+    return {"path": scheduler.LOG_PATH, "text": scheduler.tail_log(lines)}
 
 
 # --- 프런트엔드 ---

@@ -1339,7 +1339,8 @@ class ScheduleRequest(BaseModel):
 
 class ChannelAddRequest(BaseModel):
     url: str = ""
-    role: str = "news"
+    # 한 채널이 뉴스이면서 학습일 수 있다. 어느 쪽이든 자막은 한 번만 받는다.
+    roles: list = ["news"]
     category_folder: str = ""
 
 
@@ -1347,7 +1348,7 @@ class ChannelPatchRequest(BaseModel):
     # 채널 이름에 한글·공백·쉼표가 들어간다. 경로에 싣지 않고 본문으로 받는다.
     name: str
     active: bool = None
-    role: str = None
+    roles: list = None
     category_folder: str = None
 
 
@@ -1425,6 +1426,22 @@ def as_channel_url(value):
     return None
 
 
+def checked_roles(roles):
+    """역할 배열을 확인해 돌려준다. 비어 있거나 모르는 값이면 400.
+
+    비어 있는 것을 막는 이유는, 그것이 "쉬게 하기"의 뜻으로 쓰이면 화면과
+    수집이 서로 다른 말을 하기 때문이다. 쉬게 하려면 active 를 끈다.
+    """
+    if not isinstance(roles, list) or not roles:
+        raise HTTPException(400, "역할을 하나 이상 고르세요 (뉴스·학습). "
+                                 "쉬게 하려면 켬을 끄세요.")
+    unknown = [r for r in roles if r not in scheduler.collect.ROLES]
+    if unknown:
+        raise HTTPException(400, "모르는 역할입니다: {}".format(", ".join(map(str, unknown))))
+    # 순서와 중복을 정리해 파일에 늘 같은 모양으로 들어가게 한다
+    return [r for r in scheduler.collect.ROLES if r in roles]
+
+
 def friendly_channel_error(exc):
     """yt-dlp 가 뱉는 재시도 경고를 걷어내고 사람이 읽을 한 줄로 만든다."""
     text = str(exc)
@@ -1442,8 +1459,7 @@ def api_schedule_channel_add(req: ChannelAddRequest):
     주소가 틀린 채널이 들어가면 예약 수집이 돌 때 조용히 실패하고, 그 사실은
     다음 주에야 눈에 띈다. 들어오는 자리에서 막는다.
     """
-    if req.role not in scheduler.collect.ROLES:
-        raise HTTPException(400, "역할은 뉴스·학습·재료 중 하나여야 합니다.")
+    roles = checked_roles(req.roles)
     url = as_channel_url(req.url)
     if not url:
         raise HTTPException(400,
@@ -1469,7 +1485,7 @@ def api_schedule_channel_add(req: ChannelAddRequest):
     config.setdefault("channels", []).append({
         "name": name,
         "url": meta.get("url") or resolved["url"],
-        "role": req.role,
+        "roles": roles,
         "active": True,
         "category_folder": req.category_folder or "",
         "state": "confirmed",
@@ -1496,10 +1512,10 @@ def api_schedule_channel_patch(req: ChannelPatchRequest):
 
     if req.active is not None:
         target["active"] = bool(req.active)
-    if req.role is not None:
-        if req.role not in scheduler.collect.ROLES:
-            raise HTTPException(400, "역할은 뉴스·학습·재료 중 하나여야 합니다.")
-        target["role"] = req.role
+    if req.roles is not None:
+        target["roles"] = checked_roles(req.roles)
+        # 옛 형식 키가 남아 있으면 둘이 어긋난다. 새 형식만 남긴다.
+        target.pop("role", None)
     if req.category_folder is not None:
         target["category_folder"] = req.category_folder.strip()
 

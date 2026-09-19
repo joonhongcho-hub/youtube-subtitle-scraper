@@ -98,6 +98,11 @@ def save_channels(config):
     if problems:
         raise ValueError("채널 목록 형식이 맞지 않습니다: {}".format(
             " / ".join(problems[:3])))
+    # 쓸 때는 늘 새 형식으로만 쓴다. 옛 role 키를 남겨두면 두 키가 서로 다른
+    # 말을 하게 되고, 어느 쪽이 참인지 나중에 알 수 없다.
+    for entry in config.get("channels", []):
+        if isinstance(entry, dict):
+            collect.upgrade_roles(entry)
     config["updated"] = datetime.date.today().strftime("%Y%m%d")
     os.makedirs(SHARED_DIR, exist_ok=True)
     storage.save_json(os.path.join(SHARED_DIR, "channels.json"), config)
@@ -279,7 +284,7 @@ def channel_rows(find_dir=None):
             "name": name,
             "url": entry.get("url", ""),
             "handle": handle_of(entry.get("url", "")),
-            "role": entry.get("role", "news"),
+            "roles": collect.roles_of(entry),
             "active": bool(entry.get("active", True)),
             "state": entry.get("state", "confirmed"),
             "category_folder": entry.get("category_folder", ""),

@@ -22,8 +22,10 @@
 
 `channels.json`이 형식에 어긋나면 `collect.py`는 무엇이 잘못됐는지 찍고 **수집을
 시작하지 않는다.** 기본값으로 얼버무리고 몇 시간을 돌리는 것보다 낫기 때문이다.
-`role`은 `news`(브리핑에 들어감) · `study`(받아두되 브리핑에는 안 들어감) ·
-`material`(쌓아만 둠, 수집 대상 아님) 셋이고, `state`는 `confirmed` / `pending` / `failed`,
+`roles`는 **배열**이고 값은 `news`(주간 브리핑에 들어감)와 `study`(학습 탭 재료)
+둘뿐이다. 한 채널이 둘 다 가질 수 있고 비어 있으면 오류다 — 쉬게 하려면 `active`를
+끈다. 옛 형식인 `role`(문자열)도 읽어주고(`material`은 `["study"]`로 옮긴다) 쓸 때는
+늘 `roles`로만 쓴다. `state`는 `confirmed` / `pending` / `failed`,
 `url`은 반드시 링크여야 한다. 채널명만 적으면 `resolve_channel`이 사람에게 번호를
 물어보는데 예약 실행에는 답할 사람이 없다.
 
@@ -42,6 +44,7 @@
 
 | 필드 | 뜻 |
 |---|---|
+| `roles` | **배열.** `channels.json` 의 역할을 그대로 내보낸다 (`["news"]` `["study"]` `["news","study"]`). 옛 `role` 문자열은 더 쓰지 않는다 |
 | `last_content_at` / `last_count` | **마지막으로 1편 이상 받은 날과 그때 편수.** 둘은 늘 같은 실행을 가리킨다 |
 | `this_run` | 이번 실행에서 받은 편수 |
 | `total_files` | 폴더의 자막 수. **폴더가 없으면 `null`** — 0(폴더는 있는데 빔)과 다른 상태다 |

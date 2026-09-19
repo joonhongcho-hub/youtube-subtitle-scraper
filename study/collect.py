@@ -42,12 +42,17 @@ STATUS_PATH = os.path.join(DATA_DIR, "status.json")
 SCHEMA = 1
 
 # channels.json 에 올 수 있는 값. 여기 없는 값이 오면 수집을 시작하지 않는다.
-#   news     브리핑에 들어간다
-#   study    받아두되 브리핑에는 안 들어간다
-#   material 나중에 찾아 쓰려고 쌓아만 둔다 — 예약 수집 대상이 아니다
-ROLES = ("news", "study", "material")
-COLLECTED_ROLES = ("news", "study")
+# 역할은 자막을 받을지 말지가 아니라 "받아둔 자막을 어디에 쓰는지"다.
+#   news   주간 브리핑에 들어간다
+#   study  학습 탭의 재료로 쓴다
+# 한 채널이 둘 다 가질 수 있다. 어느 쪽이든 자막은 한 번만 받는다.
+# 등록된 채널은 모두 수집 대상이고, 쉬게 하려면 active 를 끈다.
+ROLES = ("news", "study")
 STATES = ("confirmed", "pending", "failed")
+
+# 옛 형식의 role(문자열) → roles(배열). material 은 쌓아만 두던 채널이라
+# 학습 재료로 옮긴다 — 브리핑에 넣으면 성격이 달라진다.
+LEGACY_ROLES = {"news": ["news"], "study": ["study"], "material": ["study"]}
 
 # 기준일이 아예 없는 채널을 처음 돌릴 때 얼마나 거슬러 올라갈지
 FIRST_RUN_DAYS = 14
@@ -66,6 +71,28 @@ def channels_path(config_dir=None):
     if os.path.exists(shared):
         return shared
     return os.path.join(DEFAULT_CONFIG_DIR, "channels.json")
+
+
+def roles_of(entry):
+    """채널의 역할 목록. 옛 형식(role 문자열)도 읽어 배열로 준다.
+
+    파일은 코워크와 화면이 함께 쓴다. 옛 키가 남아 있는 파일을 만나도 멈추지
+    않고 읽되, 쓸 때는 항상 새 형식으로만 쓴다 (upgrade_roles 참고).
+    """
+    raw = entry.get("roles", entry.get("role"))
+    if isinstance(raw, list):
+        return [r for r in raw if isinstance(r, str)]
+    # roles 자리에 문자열 하나가 들어 있어도 옛 형식과 같게 읽는다
+    if isinstance(raw, str):
+        return list(LEGACY_ROLES.get(raw, [raw]))
+    return []
+
+
+def upgrade_roles(entry):
+    """항목 하나를 새 형식으로 맞춘다 — roles 만 남기고 옛 role 키는 지운다."""
+    entry["roles"] = roles_of(entry)
+    entry.pop("role", None)
+    return entry
 
 
 def resolve_root(settings):
@@ -209,6 +236,30 @@ def count_records(folder):
                if isinstance(r, dict) and r.get("status") == subtitle.SUCCESS)
 
 
+def role_problems(entry, where):
+    """역할이 어긋난 곳을 적어 돌려준다. 무엇이 잘못됐는지 그대로 적는다."""
+    raw = entry.get("roles", entry.get("role"))
+    if isinstance(raw, str):
+        # 옛 형식(role 문자열)은 읽어준다. 저장할 때 새 형식으로 바뀐다.
+        if raw not in LEGACY_ROLES:
+            return ["{}: 모르는 역할 {!r} — {} 만 쓸 수 있습니다".format(
+                where, raw, " 와 ".join(ROLES))]
+        raw = LEGACY_ROLES[raw]
+    if raw is None:
+        return ["{}: roles 가 없습니다. {} 중 하나 이상을 넣으세요".format(
+            where, " 또는 ".join(ROLES))]
+    if not isinstance(raw, list):
+        return ["{}: roles 는 배열이어야 합니다 (지금 {!r})".format(where, raw)]
+    if not raw:
+        return ["{}: roles 가 비어 있습니다. {} 중 하나 이상을 넣으세요 "
+                "(쉬게 하려면 active 를 끄세요)".format(where, " 또는 ".join(ROLES))]
+    unknown = [r for r in raw if r not in ROLES]
+    if unknown:
+        return ["{}: 모르는 역할 {} — {} 만 쓸 수 있습니다".format(
+            where, ", ".join(repr(u) for u in unknown), " 와 ".join(ROLES))]
+    return []
+
+
 def channel_problems(config):
     """channels.json 형식을 살펴 어긋난 곳을 모두 적어 돌려준다.
 
@@ -249,9 +300,7 @@ def channel_problems(config):
             # 예약 실행에는 답할 사람이 없으므로 시작 전에 잡는다.
             problems.append("{}: url 이 링크가 아닙니다 ({!r})".format(where, url))
 
-        if entry.get("role") not in ROLES:
-            problems.append("{}: role 은 {} 중 하나여야 합니다 (지금 {!r})".format(
-                where, " 또는 ".join(ROLES), entry.get("role")))
+        problems.extend(role_problems(entry, where))
 
         if not isinstance(entry.get("active"), bool):
             problems.append("{}: active 는 true/false 여야 합니다 (지금 {!r})".format(
@@ -283,14 +332,13 @@ def validate_channels(config):
 
 
 def collect_targets(config):
-    """수집 대상만 골라낸다 — 확인된 뉴스·학습 채널 중 켜져 있는 것.
+    """수집 대상만 골라낸다 — 확인됐고 켜져 있는 채널 전부.
 
-    재료(material)는 쌓아만 두는 채널이라 예약 수집이 건드리지 않는다.
+    역할은 받아둔 자막을 어디에 쓰는지일 뿐이라 대상을 가르지 않는다.
+    한 채널이 뉴스이면서 학습이어도 자막은 한 번만 받는다.
     """
     out = []
     for entry in config.get("channels", []):
-        if entry.get("role") not in COLLECTED_ROLES:
-            continue
         if not entry.get("active", True):
             continue
         if entry.get("state", "confirmed") != "confirmed":
@@ -474,7 +522,7 @@ def build_status(config, settings, state, summaries, failures, targets,
 
         channels.append({
             "name": name,
-            "role": entry.get("role"),
+            "roles": roles_of(entry),
             "active": bool(entry.get("active", True)),
             "state": entry.get("state", "confirmed"),
             # 날짜와 편수는 늘 같은 실행을 가리킨다 — 마지막으로 1편 이상 받은 실행
@@ -538,7 +586,7 @@ def main(argv=None):
     if args.only:
         targets = [t for t in targets if t["name"] == args.only]
     if not targets:
-        die("수집할 채널이 없습니다. channels.json 의 role/active/state 를 확인하세요.")
+        die("수집할 채널이 없습니다. channels.json 의 active/state 를 확인하세요.")
 
     if args.dry_run:
         for entry in targets:

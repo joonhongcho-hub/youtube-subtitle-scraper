@@ -354,7 +354,9 @@
         <span class="text-xs text-slate-400">바꾸면 곧바로 저장됩니다</span>
       </div>
       <p class="text-xs text-slate-500 mb-4">
-        <b>뉴스</b>는 브리핑에 들어갑니다 · <b>학습</b>은 받아두되 브리핑에는 안 들어갑니다 · <b>재료</b>는 나중에 찾아 쓰려고 쌓아만 둡니다
+        등록된 채널은 모두 수집합니다. 역할은 <b>받아둔 자막을 어디에 쓰는지</b>입니다 —
+        <b>뉴스</b>는 주간 브리핑에, <b>학습</b>은 학습 탭 재료로. 둘 다 골라도 자막은 한 번만 받습니다.
+        쉬게 하려면 <b>켬</b>을 끄세요.
       </p>
       <div id="schedProblems" class="hidden mb-4 px-3 py-2 rounded bg-red-50 border border-red-200 text-red-700 text-xs"></div>
       <div id="schedChannels" class="divide-y divide-slate-100"></div>
@@ -367,11 +369,14 @@
         <input id="addQuery" type="text" autocomplete="off"
                placeholder="채널명 · @핸들 · URL · 채널 ID"
                class="flex-1 min-w-[16rem] px-4 py-2.5 rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-slate-400">
-        <select id="addRole" class="px-3 py-2.5 rounded-lg border border-slate-300 text-sm">
-          <option value="news">뉴스</option>
-          <option value="study">학습</option>
-          <option value="material">재료</option>
-        </select>
+        <span class="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-slate-300 text-sm">
+          <label class="flex items-center gap-1.5">
+            <input id="addNews" type="checkbox" class="w-4 h-4 rounded border-slate-300" checked> 뉴스
+          </label>
+          <label class="flex items-center gap-1.5">
+            <input id="addStudy" type="checkbox" class="w-4 h-4 rounded border-slate-300"> 학습
+          </label>
+        </span>
         <input id="addFolder" type="text" placeholder="저장 폴더"
                class="w-44 px-3 py-2.5 rounded-lg border border-slate-300 text-sm">
         <button id="addBtn" class="px-5 py-2.5 rounded-lg bg-slate-900 text-white text-sm font-medium hover:bg-slate-700">확인</button>

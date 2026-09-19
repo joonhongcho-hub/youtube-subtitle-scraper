@@ -1649,7 +1649,7 @@ async function openFindPreview(row) {
 // 화면 문구는 여기서 만든다. 서버는 코드 문자열만 준다 — 문구를 고치려고
 // 맥 쪽 코드를 고치는 일이 없게 하기 위해서다.
 const SCHED_DAYS = ['일', '월', '화', '수', '목', '금', '토'];
-const ROLE_LABEL = { news: '뉴스', study: '학습', material: '재료' };
+const ROLE_LABEL = { news: '뉴스', study: '학습' };
 const FLAG_LABEL = {
   not_targeted: '이번 회차 대상 아님',
   orphan_files: '장부에 없는 파일 있음',
@@ -1823,14 +1823,19 @@ function channelRow(row) {
   const last = row.last_content_at
     ? `마지막 ${formatDate8(row.last_content_at)} · ${formatCount(row.last_count)}편`
     : '받은 적 없음';
-  const roles = Object.keys(ROLE_LABEL).map((key) =>
-    `<option value="${key}"${row.role === key ? ' selected' : ''}>${ROLE_LABEL[key]}</option>`).join('');
+  // 한 채널이 뉴스이면서 학습일 수 있다. 하나만 고르는 드롭다운으로는 못 적는다.
+  const roles = Object.keys(ROLE_LABEL).map((key) => `
+      <label class="flex items-center gap-1 text-xs text-slate-500">
+        <input type="checkbox" class="chRole w-4 h-4 rounded border-slate-300" data-role="${key}"${
+  (row.roles || []).includes(key) ? ' checked' : ''}> ${ROLE_LABEL[key]}
+      </label>`).join('');
 
   return `<div class="py-3 flex items-center gap-3 flex-wrap ${warn ? 'bg-red-50/40' : ''}" data-name="${escapeHtml(row.name)}">
     <span class="w-8 h-8 rounded-full bg-slate-200 text-slate-600 grid place-items-center text-sm font-semibold shrink-0">${escapeHtml(row.name.slice(0, 1))}</span>
     <div class="min-w-[12rem] flex-1">
       <div class="text-sm font-medium">${escapeHtml(row.name)}</div>
-      <div class="text-xs text-slate-400">${escapeHtml(row.handle || row.url)}</div>
+      <div class="text-xs text-slate-400">${escapeHtml(row.handle || row.url)}
+        · <span class="text-slate-500">${escapeHtml(roleText(row.roles))}</span></div>
     </div>
     <div class="text-xs text-slate-500 tabular-nums min-w-[11rem]">
       <div>${last}</div>
@@ -1841,12 +1846,17 @@ function channelRow(row) {
       <label class="flex items-center gap-1 text-xs text-slate-500">
         <input type="checkbox" class="chActive w-4 h-4 rounded border-slate-300"${row.active ? ' checked' : ''}> 켬
       </label>
-      <select class="chRole px-2 py-1.5 rounded border border-slate-300 text-sm">${roles}</select>
+      <span class="flex items-center gap-2 px-2 py-1 rounded border border-slate-200">${roles}</span>
       <input class="chFolder w-36 px-2 py-1.5 rounded border border-slate-300 text-sm"
              list="schedFolders" value="${escapeHtml(row.category_folder || '')}" placeholder="저장 폴더">
       <button class="chDelete text-xs text-slate-400 hover:text-red-600 px-1">삭제</button>
     </div>
   </div>`;
+}
+
+// "뉴스", "학습", "뉴스·학습"
+function roleText(roles) {
+  return (roles || []).map((r) => ROLE_LABEL[r] || r).join('·') || '역할 없음';
 }
 
 function rowName(el) {
@@ -1873,7 +1883,16 @@ $('schedChannels').addEventListener('change', (e) => {
   if (el.classList.contains('chActive')) {
     patchChannel(rowName(el), { active: el.checked }, el.checked ? '켰습니다' : '껐습니다');
   } else if (el.classList.contains('chRole')) {
-    patchChannel(rowName(el), { role: el.value }, `${ROLE_LABEL[el.value]}로 바꿨습니다`);
+    const row = el.closest('[data-name]');
+    const roles = [...row.querySelectorAll('.chRole')]
+      .filter((box) => box.checked).map((box) => box.dataset.role);
+    if (!roles.length) {
+      // 역할이 하나도 없으면 저장하지 않는다. 쉬게 하려면 "켬"을 끄면 된다.
+      el.checked = true;
+      showError('역할은 하나 이상이어야 합니다. 쉬게 하려면 켬을 끄세요.');
+      return;
+    }
+    patchChannel(rowName(el), { roles }, `${roleText(roles)}으로 바꿨습니다`);
   } else if (el.classList.contains('chFolder')) {
     sched.lastFolder = el.value.trim();
     patchChannel(rowName(el), { category_folder: el.value.trim() }, '저장 폴더를 바꿨습니다');
@@ -1906,7 +1925,16 @@ function addNote(message, tone) {
   box.classList.remove('hidden');
 }
 
+function addRoles() {
+  return [['news', $('addNews')], ['study', $('addStudy')]]
+    .filter(([, box]) => box.checked).map(([key]) => key);
+}
+
 async function addChannel(url) {
+  if (!addRoles().length) {
+    addNote('역할을 하나 이상 고르세요 (뉴스·학습).', 'bg-red-50 text-red-700');
+    return;
+  }
   addNote('채널을 확인하는 중…', 'bg-slate-50 text-slate-600');
   try {
     const d = await api('/api/schedule/channels', {
@@ -1914,7 +1942,7 @@ async function addChannel(url) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         url,
-        role: $('addRole').value,
+        roles: addRoles(),
         category_folder: $('addFolder').value.trim() || sched.lastFolder,
       }),
     });

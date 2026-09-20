@@ -714,10 +714,22 @@ let queueBusy = false;
 
 // 상단 요약 — 돌고 있거나 줄 서 있는 게 있으면 어느 탭에서든 한 줄로 알린다.
 // 예전에는 대기 중인 게 있을 때만 떠서, 채널 하나만 돌 때는 아무 표시가 없었다.
+// 서버가 끊겼다 다시 뜨면서 무엇을 이어받았는지 한 번만 알린다.
+// 새로고침할 때마다 같은 말을 되풀이하면 잔소리가 된다.
+let resumeNoticeShown = false;
+
 async function loadQueue() {
   const bar = $('queueBar');
   try {
     const data = await api('/api/queue');
+    const resumed = data.resumed || {};
+    if (!resumeNoticeShown && (resumed.jobs || resumed.schedule)) {
+      resumeNoticeShown = true;
+      const parts = [];
+      if (resumed.jobs) parts.push(`끊겼던 작업 ${formatCount(resumed.jobs)}건`);
+      if (resumed.schedule) parts.push(`예약 수집 남은 채널 ${formatCount(resumed.schedule)}개`);
+      showNotice(`${parts.join(' · ')}을(를) 이어서 돌립니다.`);
+    }
     const r = data.running;
     queueBusy = Boolean(r);
     if (!r && !data.pending.length) { bar.classList.add('hidden'); return; }
@@ -1863,12 +1875,12 @@ function channelRow(row) {
 
   return `<div class="py-3 flex items-center gap-3 flex-wrap ${warn ? 'bg-red-50/40' : ''}" data-name="${escapeHtml(row.name)}">
     <span class="w-8 h-8 rounded-full bg-slate-200 text-slate-600 grid place-items-center text-sm font-semibold shrink-0">${escapeHtml(row.name.slice(0, 1))}</span>
-    <div class="min-w-[12rem] flex-1">
-      <div class="text-sm font-medium">${escapeHtml(row.name)}</div>
-      <div class="text-xs text-slate-400">${escapeHtml(row.handle || row.url)}
-        · <span class="text-slate-500">${escapeHtml(roleText(row.roles))}</span></div>
+    <div class="flex-1 min-w-0">
+      <div class="text-sm font-medium truncate">${escapeHtml(row.name)}</div>
+      <div class="text-xs text-slate-400 truncate" title="${escapeHtml(row.url)}">${
+  escapeHtml(row.handle || row.url)} · <span class="text-slate-500">${escapeHtml(roleText(row.roles))}</span></div>
     </div>
-    <div class="text-xs text-slate-500 tabular-nums min-w-[11rem]">
+    <div class="text-xs text-slate-500 tabular-nums w-44 shrink-0">
       <div>${last}</div>
       <div>${files}${row.last_failed ? ` · 실패 ${formatCount(row.last_failed)}건` : ''}</div>
     </div>
@@ -2062,7 +2074,8 @@ function renderRun(run) {
     ? 'bg-slate-200 text-slate-400'
     : 'bg-slate-900 text-white hover:bg-slate-700');
   $('runState').textContent = busy
-    ? `${run.index}/${run.total} 채널 · ${run.channel || '준비 중'} · 지금까지 ${formatCount(run.collected)}편`
+    ? `${run.resumed ? '이어받는 중 · ' : ''}${run.index}/${run.total} 채널 · ${
+  run.channel || '준비 중'} · 지금까지 ${formatCount(run.collected)}편`
     : (run.finished_at
       ? `마지막 실행 — 수집 ${formatCount(run.collected)}편${run.failed ? ` · 실패 ${formatCount(run.failed)}건` : ''}`
       : '');

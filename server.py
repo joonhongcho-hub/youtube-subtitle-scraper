@@ -45,6 +45,59 @@ def restore_jobs():
         print("이전 작업 {}건을 복원했습니다.".format(count))
 
 
+# 며칠 전에 끊긴 작업까지 서버를 켤 때마다 되살리면, 시키지도 않은 일을
+# 하는 셈이 된다. 최근 것만 이어간다.
+RESUME_MAX_AGE_DAYS = 7
+# 이번에 무엇을 이어받았는지 — 화면이 한 번 알려주려고 본다
+RESUMED = {"jobs": 0, "schedule": 0}
+
+
+def resumable_jobs():
+    """서버가 죽어 끊긴 작업만 고른다.
+
+    사람이 중지한 작업(STOPPED)과 실패한 작업(ERROR)은 건드리지 않는다 —
+    멈춘 데에는 이유가 있었고, 그건 버튼으로 이어가면 된다.
+    """
+    cutoff = time.time() - RESUME_MAX_AGE_DAYS * 86400
+    picked = []
+    for job in jobs.registry.jobs.values():
+        if job.status != jobs.STATUS_INTERRUPTED:
+            continue
+        if not job.targets or job.done >= job.total:
+            continue
+        if (job.started_at or 0) < cutoff:
+            continue
+        if (job.options or {}).get("schedule_run"):
+            continue      # 예약 실행이 같은 채널을 다시 돈다
+        picked.append(job)
+    return sorted(picked, key=lambda j: j.started_at or 0)
+
+
+@app.on_event("startup")
+def resume_interrupted():
+    """끊긴 수집을 이어간다 — 대기열에 다시 넣기만 하면 감시 스레드가 돌린다.
+
+    이 맥은 메모리가 모자라 서버가 강제로 내려간 적이 있다. 그때 돌던 작업이
+    조용히 사라지면 사용자는 며칠 뒤에야 안 받아진 것을 알아챈다.
+    """
+    for job in resumable_jobs():
+        job.log("info", "서버가 끊겨 멈췄던 작업을 이어서 돌립니다.")
+        enqueue_or_start(job)
+        RESUMED["jobs"] += 1
+    if RESUMED["jobs"]:
+        print("끊겼던 작업 {}건을 이어서 돌립니다.".format(RESUMED["jobs"]))
+
+    try:
+        resumed = scheduler.resume_run(enqueue_or_start, schedule_dir_finder())
+    except Exception as exc:                      # noqa: BLE001
+        print("예약 수집을 이어가지 못했습니다: {}".format(exc))
+        return
+    if resumed:
+        RESUMED["schedule"] = resumed["remaining"]
+        print("끊겼던 예약 수집을 이어갑니다 — 남은 채널 {}개".format(
+            resumed["remaining"]))
+
+
 @app.on_event("startup")
 def tidy_channel_dirs():
     """저장 폴더에 남은 옛 부기 파일을 앱 폴더로 치운다.
@@ -600,6 +653,7 @@ def api_queue():
             }
             for i, job in enumerate(jobs.registry.pending())
         ],
+        "resumed": dict(RESUMED),
         "recent": [
             {
                 "job_id": job.id,

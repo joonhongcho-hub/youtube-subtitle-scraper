@@ -385,11 +385,53 @@ RUN = {
     "error": None,
     "logs": [],
     "job_id": None,
+    # 끊겼다가 이어받은 실행인지 — 화면이 그렇게 알려준다
+    "resumed": False,
 }
 # 채널을 도는 동안 남기는 짧은 기록. 작업 하나하나의 로그는 기존 작업 화면에 있다.
 MAX_RUN_LOGS = 200
 # 작업이 끝났는지 들여다보는 간격
 POLL_SECONDS = 1.0
+# 어디까지 돌았는지 적어두는 자리. 서버가 죽어도 남은 채널을 잃지 않는다.
+RUN_STATE_PATH = os.path.join(collect.DATA_DIR, "schedule-run.json")
+
+
+def save_progress(targets, done, limit, summaries, failures, missing):
+    """채널 하나를 마칠 때마다 남긴다.
+
+    죽어도 잃는 것은 돌던 채널 하나뿐이고, 그 채널도 이미 받은 영상은
+    건너뛰므로 다시 시작해도 손해가 없다.
+    """
+    storage.save_json(RUN_STATE_PATH, {
+        "schema": collect.SCHEMA,
+        "started_at": RUN.get("started_at"),
+        "limit": limit,
+        "targets": [t["name"] for t in targets],
+        "done": list(done),
+        "summaries": summaries,
+        "failures": failures,
+        "missing": missing,
+        "updated": now_stamp(),
+    })
+
+
+def clear_progress():
+    try:
+        os.remove(RUN_STATE_PATH)
+    except OSError:
+        pass
+
+
+def pending_run():
+    """끊긴 예약 실행이 남아 있으면 (기록, 남은 채널명)을 돌려준다."""
+    data = load_json(RUN_STATE_PATH, None)
+    if not isinstance(data, dict):
+        return None
+    done = set(data.get("done") or [])
+    remaining = [n for n in (data.get("targets") or []) if n not in done]
+    if not remaining:
+        return None
+    return data, remaining
 
 
 def run_state():
@@ -420,13 +462,62 @@ def start_run(limit, enqueue, find_dir):
         RUN.update({"running": True, "index": 0, "total": len(targets),
                     "channel": "", "limit": limit, "started_at": time.time(),
                     "finished_at": None, "collected": 0, "failed": 0,
-                    "error": None, "logs": [], "job_id": None})
+                    "error": None, "logs": [], "job_id": None,
+                    "resumed": False})
 
+    save_progress(targets, [], limit, [], [], [])
     thread = threading.Thread(target=_run_all,
                               args=(config, targets, limit, enqueue, find_dir),
                               daemon=True)
     thread.start()
     return {"total": len(targets)}
+
+
+def resume_run(enqueue, find_dir):
+    """서버가 죽어 끊긴 예약 실행을 남은 채널부터 이어간다.
+
+    채널 목록과 기준일은 지금 다시 읽는다 — 그 사이에 바뀌었을 수 있다.
+    이미 마친 채널의 요약은 파일에 남아 있으므로 그대로 이어 쓴다.
+    """
+    found = pending_run()
+    if not found:
+        return None
+    data, remaining = found
+
+    with RUN_LOCK:
+        if RUN["running"]:
+            return None
+        _, config, problems = load_channels()
+        if problems:
+            note("채널 목록이 어긋나 이어가지 못했습니다: {}".format(problems[0]))
+            return None
+        by_name = {t["name"]: t for t in collect.collect_targets(config)}
+        targets = [by_name[name] for name in remaining if name in by_name]
+        if not targets:
+            clear_progress()
+            return None
+
+        carry = {
+            "done": [n for n in (data.get("targets") or []) if n not in remaining],
+            "summaries": data.get("summaries") or [],
+            "failures": data.get("failures") or [],
+            "missing": data.get("missing") or [],
+        }
+        collected = sum(s.get("collected") or 0 for s in carry["summaries"])
+        RUN.update({"running": True, "index": 0, "total": len(targets),
+                    "channel": "", "limit": data.get("limit"),
+                    "started_at": time.time(), "finished_at": None,
+                    "collected": collected, "failed": len(carry["failures"]),
+                    "error": None, "logs": [], "job_id": None,
+                    "resumed": True})
+
+    note("끊겼던 예약 수집을 이어갑니다 — 남은 채널 {}개".format(len(targets)))
+    thread = threading.Thread(
+        target=_run_all,
+        args=(config, targets, data.get("limit"), enqueue, find_dir, carry),
+        daemon=True)
+    thread.start()
+    return {"remaining": len(targets)}
 
 
 def _wait_for(job):
@@ -469,6 +560,9 @@ def _collect_one(entry, settings, state, limit, enqueue, find_dir):
     job = jobs.Job(resolved_name, resolved["url"], folder, fresh, {
         "langs": settings.get("lang", "ko,en"),
         "timestamps": settings.get("timestamps", True),
+        # 예약 실행이 만든 작업이라는 표시. 서버가 다시 뜰 때 이 작업은
+        # 따로 되살리지 않는다 — 예약 실행 쪽이 같은 채널을 다시 돈다.
+        "schedule_run": True,
     })
     enqueue(job)
     RUN["job_id"] = job.id
@@ -479,12 +573,19 @@ def _collect_one(entry, settings, state, limit, enqueue, find_dir):
                             engine.Store(folder), since)
 
 
-def _run_all(config, targets, limit, enqueue, find_dir):
+def _run_all(config, targets, limit, enqueue, find_dir, carry=None):
     settings = load_settings()
     state = load_json(collect.STATE_PATH, {"channels": {}}) or {"channels": {}}
     state.setdefault("channels", {})
     today = datetime.date.today().strftime("%Y%m%d")
-    summaries, failures, missing = [], [], []
+    # 이어받은 실행이면 앞서 마친 채널의 결과를 그대로 물려받는다
+    carry = carry or {}
+    summaries = list(carry.get("summaries") or [])
+    failures = list(carry.get("failures") or [])
+    missing = list(carry.get("missing") or [])
+    done = list(carry.get("done") or [])
+    # 진행 파일에는 이번에 돌 채널과 이미 마친 채널을 함께 적는다
+    all_targets = [{"name": name} for name in done] + list(targets)
 
     try:
         for i, entry in enumerate(targets, 1):
@@ -497,6 +598,10 @@ def _run_all(config, targets, limit, enqueue, find_dir):
                 note("{} — 실패: {}".format(entry["name"], exc))
                 failures.append({"channel": entry["name"], "video_id": None,
                                  "reason": "CHANNEL_ERROR", "detail": str(exc)})
+
+                done.append(entry["name"])
+                save_progress(all_targets, done, limit, summaries, failures,
+                              missing)
                 continue
 
             failures.extend(summary.pop("_failures"))
@@ -507,15 +612,20 @@ def _run_all(config, targets, limit, enqueue, find_dir):
             collect.remember_run(state, entry["name"], today,
                                  summary["collected"],
                                  advance_baseline=not limit)
+            done.append(entry["name"])
+            save_progress(all_targets, done, limit, summaries, failures, missing)
 
         RUN["failed"] = len(failures)
         _write_ledger(config, settings, state, summaries, failures, missing,
-                      targets)
+                      all_targets)
         note("끝 — 수집 {}편 / 실패 {}건".format(RUN["collected"], len(failures)))
     except Exception as exc:                              # noqa: BLE001
         RUN["error"] = "{}: {}".format(type(exc).__name__, exc)
         note("멈췄습니다 — {}".format(RUN["error"]))
     finally:
+        # 끝까지 왔으면(실패로 끝났더라도) 이어받을 것이 없다. 진행 파일을
+        # 남기는 것은 프로세스가 통째로 죽은 경우뿐이다.
+        clear_progress()
         RUN["running"] = False
         RUN["finished_at"] = time.time()
         RUN["channel"] = ""
